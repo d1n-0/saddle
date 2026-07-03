@@ -38,3 +38,10 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# packaged artifacts
+*.vsix
+
+# python
+__pycache__/
+*.pyc

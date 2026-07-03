@@ -1,0 +1,129 @@
+{
+	"name": "saddle-debug",
+	"displayName": "Saddle — Minecraft Datapack Debugger",
+	"description": "Debug Minecraft datapack .mcfunction files through the Saddle mod: breakpoints (incl. macro lines), stepping, call stacks, live scoreboard/storage/entity NBT editing and a command console.",
+	"version": "1.0.0",
+	"publisher": "d1n0",
+	"license": "MIT",
+	"icon": "icon.png",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Debuggers"
+	],
+	"main": "./extension.js",
+	"activationEvents": [
+		"onDebugResolve:saddle",
+		"onDebugInitialConfigurations",
+		"onLanguage:mcfunction"
+	],
+	"contributes": {
+		"languages": [
+			{
+				"id": "mcfunction",
+				"extensions": [
+					".mcfunction"
+				],
+				"aliases": [
+					"mcfunction",
+					"Minecraft Function"
+				]
+			}
+		],
+		"breakpoints": [
+			{
+				"language": "mcfunction"
+			}
+		],
+		"debuggers": [
+			{
+				"type": "saddle",
+				"label": "Saddle: Minecraft Datapack",
+				"languages": [
+					"mcfunction"
+				],
+				"configurationAttributes": {
+					"attach": {
+						"properties": {
+							"host": {
+								"type": "string",
+								"description": "Host the Saddle DAP server listens on (-Dsaddle.host).",
+								"default": "127.0.0.1"
+							},
+							"port": {
+								"type": "number",
+								"description": "Port the Saddle DAP server listens on (-Dsaddle.port).",
+								"default": 16352
+							}
+						}
+					}
+				},
+				"initialConfigurations": [
+					{
+						"type": "saddle",
+						"request": "attach",
+						"name": "Attach to Minecraft (Saddle)",
+						"host": "127.0.0.1",
+						"port": 16352
+					}
+				],
+				"configurationSnippets": [
+					{
+						"label": "Saddle: Attach to Minecraft",
+						"description": "Attach to a running Minecraft server/world with the Saddle mod",
+						"body": {
+							"type": "saddle",
+							"request": "attach",
+							"name": "Attach to Minecraft (Saddle)",
+							"host": "127.0.0.1",
+							"port": 16352
+						}
+					}
+				]
+			}
+		],
+		"commands": [
+			{
+				"command": "saddle.runCommand",
+				"title": "Saddle: Run Minecraft Command"
+			},
+			{
+				"command": "saddle.getScoreboard",
+				"title": "Saddle: Show Scoreboard"
+			},
+			{
+				"command": "saddle.setScore",
+				"title": "Saddle: Set Scoreboard Score"
+			},
+			{
+				"command": "saddle.listEntities",
+				"title": "Saddle: List Entities"
+			},
+			{
+				"command": "saddle.getData",
+				"title": "Saddle: Get NBT Data (storage/entity/block)"
+			},
+			{
+				"command": "saddle.setData",
+				"title": "Saddle: Set NBT Data (storage/entity/block)"
+			},
+			{
+				"command": "saddle.getBlock",
+				"title": "Saddle: Inspect Block"
+			},
+			{
+				"command": "saddle.showTrace",
+				"title": "Saddle: Show Execution Trace"
+			},
+			{
+				"command": "saddle.pin",
+				"title": "Saddle: Watch Expression (Pin to Variables)"
+			},
+			{
+				"command": "saddle.unpin",
+				"title": "Saddle: Unpin Watched Expression"
+			}
+		]
+	}
+}

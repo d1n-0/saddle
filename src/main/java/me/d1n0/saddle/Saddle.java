@@ -1,24 +1,49 @@
 package me.d1n0.saddle;
 
+import me.d1n0.saddle.dap.DapServer;
+import me.d1n0.saddle.debugger.BreakpointManager;
+import me.d1n0.saddle.debugger.DebugSession;
+import me.d1n0.saddle.debugger.FunctionIndex;
+
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.MinecraftServer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashSet;
+import java.util.Set;
+
 public class Saddle implements ModInitializer {
 	public static final String MOD_ID = "saddle";
-
-	// This logger is used to write text to the console and the log file.
-	// It is considered best practice to use your mod id as the logger's name.
-	// That way, it's clear which mod wrote info, warnings, and errors.
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	@Override
 	public void onInitialize() {
-		// This code runs as soon as Minecraft is in a mod-load-ready state.
-		// However, some things (like resources) may still be uninitialized.
-		// Proceed with mild caution.
+		String host = System.getProperty("saddle.host", "127.0.0.1");
+		int port = Integer.getInteger("saddle.port", 16352);
 
-		LOGGER.info("Hello Fabric world!");
+		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+			DebugSession.bind(server);
+			DapServer.start(host, port);
+		});
+
+		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) -> {
+			if (success) pruneRemovedFunctions(server);
+		});
+
+		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
+			DebugSession.shutdown();
+			DapServer.stop();
+		});
+	}
+
+	private static void pruneRemovedFunctions(MinecraftServer server) {
+		Set<Identifier> live = new HashSet<>();
+		server.getFunctions().getFunctionNames().forEach(live::add);
+		FunctionIndex.retainAll(live);
+		BreakpointManager.retainAll(live);
 	}
 }

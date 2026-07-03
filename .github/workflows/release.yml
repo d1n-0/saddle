@@ -1,0 +1,37 @@
+# Publishes a GitHub Release with the mod jar and the VS Code extension
+# whenever a version tag (v*) is pushed.
+
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+      - name: setup jdk
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: make gradle wrapper executable
+        run: chmod +x ./gradlew
+      - name: build mod
+        run: ./gradlew build
+      - name: package vscode extension
+        run: |
+          cd vscode-extension
+          npx --yes @vscode/vsce package --allow-missing-repository
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/*.jar
+            vscode-extension/*.vsix
+          generate_release_notes: true

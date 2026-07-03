@@ -1,7 +1,5 @@
-# Automatically build the project and run any configured tests for every push
-# and submitted pull request. This can help catch issues that only occur on
-# certain platforms or Java versions, and provides a first line of defence
-# against bad commits.
+# Build the mod, validate the VS Code extension, and run the full DAP smoke
+# test against a real dedicated server for every push and pull request.
 
 name: build
 on: [pull_request, push]
@@ -23,6 +21,31 @@ jobs:
         run: chmod +x ./gradlew
       - name: build
         run: ./gradlew build
+      - name: validate vscode extension
+        run: node --check vscode-extension/extension.js
+      - name: prepare test server
+        run: |
+          mkdir -p run
+          printf 'eula=true\n' > run/eula.txt
+          printf 'max-tick-time=-1\nonline-mode=false\npause-when-empty-seconds=0\nlevel-type=minecraft:flat\nview-distance=4\nsimulation-distance=4\n' > run/server.properties
+      - name: run dap smoke test
+        timeout-minutes: 20
+        run: |
+          ./gradlew runServer > server.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 120); do
+            grep -q "Saddle DAP server listening" server.log && break
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "server exited during startup"; tail -50 server.log; exit 1
+            fi
+            sleep 5
+          done
+          grep -q "Saddle DAP server listening" server.log || { echo "DAP server never started"; tail -50 server.log; exit 1; }
+          python3 scripts/dap_smoke_test.py
+          kill $SERVER_PID || true
+      - name: show server log on failure
+        if: failure()
+        run: tail -100 server.log || true
       - name: capture build artifacts
         uses: actions/upload-artifact@v4
         with:

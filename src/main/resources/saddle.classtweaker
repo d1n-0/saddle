@@ -1,0 +1,3 @@
+classTweaker	v1	official
+# FunctionBuilder is package-private; CommandFunctionMixin references it in a @WrapOperation handler.
+accessible	class	net/minecraft/commands/functions/FunctionBuilder
