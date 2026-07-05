@@ -8,12 +8,12 @@ In Minecraft, a saddle is what lets you take the reins of something that otherwi
 
 - Minecraft **26.2** / Fabric Loader ≥ 0.19.0 / Fabric API
 - Java 25 (26.x is unobfuscated; the buildscript uses the no-remap `net.fabricmc.fabric-loom` plugin)
-- DAP endpoint: `127.0.0.1:16352` — override with `-Dsaddle.host` / `-Dsaddle.port`
+- DAP endpoint: `127.0.0.1:16352` — override with `-Dsaddle.host` / `-Dsaddle.port`. Non-loopback binds are refused unless `-Dsaddle.allowRemote=true` is set: the debug port allows unauthenticated command execution, so only expose it on trusted or tunneled networks
 
 ## Quick start
 
 1. Install the mod (plus Fabric API) and start a world or server.
-2. Install the VS Code extension:
+2. Install the VS Code extension **[Saddle — Minecraft Datapack Debugger](https://marketplace.visualstudio.com/items?itemName=d1n0.saddle-debug)** from the Marketplace (or search "Saddle" in the Extensions view). To build it from source instead:
 
    ```sh
    cd vscode-extension
@@ -40,10 +40,10 @@ See [`vscode-extension/README.md`](vscode-extension/README.md) for the editor-si
 | Breakpoints | `setBreakpoints`, `breakpointLocations` — plain commands and macro lines; comment/blank lines shift to the next executable line |
 | Execution | `continue`, `next`, `stepIn`, `stepOut`, `pause` |
 | State | `threads`, `stackTrace`, `scopes`, `variables`, `setVariable`, `source` |
-| Console | `evaluate` — runs any command; while suspended it executes in an isolated `ExecutionContext`. `completions` serves Brigadier suggestions, so the Debug Console autocompletes like the in-game chat |
+| Console | `evaluate` — runs any command, responding asynchronously so a command that hits a breakpoint never delays the stack view; while suspended it executes in an isolated `ExecutionContext`. `completions` serves Brigadier suggestions, so the Debug Console autocompletes like the in-game chat |
 | Hover | `evaluate(context: hover)` resolves macro arguments (`$(name)`), entity selectors (`@e[...]`) and coordinate triples (`~ ~2 ~`) without executing commands |
 | Output | in-game chat is mirrored to the client as `output` events: system broadcasts (`/say`, deaths, joins), player chat, and per-player messages (`/tellraw`, `/msg`) |
-| Time travel | `stepBack` / `reverseContinue` navigate a recording of executed commands (ring buffer, `-Dsaddle.ttd.steps`, default 20k). While in the past, the stack, executor, macro arguments and **reconstructed scoreboard/storage state** ("… (recorded)" scopes) are shown for that moment; forward stepping replays the recording back to the present, and `continue` past the recording resumes live execution. `saddle/trace` returns the recent execution trace |
+| Time travel | `stepBack` / `reverseContinue` navigate a recording of executed commands (ring buffer, `-Dsaddle.ttd.steps`, default 20k). While in the past, the stack, executor, macro arguments and **reconstructed scoreboard/storage state** are shown for that moment — the scopes keep their live names so expanded rows survive moving between present and history, and the Executor scope carries a `(time travel)` marker. Forward stepping replays the recording back to the present; `continue` past the recording resumes live execution. `saddle/trace` returns the recent execution trace |
 
 ### Variables ("registers & memory")
 
@@ -60,12 +60,23 @@ Hovering over `$(name)`, `@e[...]` or `1 2 3`/`~ ~2 ~` in a `.mcfunction` file w
 
 ### Watch & pin expressions
 
-The VS Code WATCH panel and the pinned "Watched" scope (`saddle/pin`, `saddle/unpin`, `saddle/pins` requests) accept:
+The VS Code WATCH panel, the pinned "Watched" scope (`saddle/pin`, `saddle/unpin`, `saddle/pins`) and the **Saddle Watch** view all accept:
 
 - `@e[type=pig]` — matched entities, expandable into live NBT
 - `storage <id> [path]` / `entity <uuid> [path]` / `block <x> <y> <z> [path]` — live (editable) NBT at the target
-- `score <objective> <holder>` — a score value
+- `score <objective> [holder]` — one score, or the whole objective (editable) when the holder is omitted
+- `scoreboard` / `storage` — every objective / every storage id
 - `$(name)` — macro argument of the selected frame; bare coordinate triples resolve to the block they point at
+
+### Saddle Watch (real time + editable, no breakpoint required)
+
+The extension adds a **Saddle Watch** view to the Run and Debug sidebar — one watch panel that does what WATCH and Variables do together, without needing a breakpoint:
+
+- **Real time**: pinned expressions refresh on a timer (`saddle.liveWatchRefreshInterval`, default 1 s) through the stateless `saddle/live {expression, path}` request, which reads game state on the server thread whether the game is running or suspended — scoreboards tick up live, entity positions move, storage updates as your functions write it.
+- **Editable**: rows backed by scores or NBT show an inline pencil; edits go through `saddle/liveSet {expression, path, name, value}` and apply to the live game immediately.
+- **Native styling**: the view renders with VS Code's own debug token theme (monospace rows, `debugTokenExpression.*` colors for names, numbers, strings), so it looks exactly like the Variables/WATCH panels.
+
+To keep a single watch panel, hide the built-in one once: right-click any section header in the Run and Debug sidebar and uncheck **Watch** — VS Code remembers. (Extensions cannot remove or replace built-in views, and the built-in WATCH only re-evaluates when the debugger stops; both are platform limits. Drag Saddle Watch to WATCH's old spot and the layout also sticks.)
 
 ### Custom requests
 
@@ -86,10 +97,11 @@ printf 'max-tick-time=-1\nonline-mode=false\npause-when-empty-seconds=0\n' > run
 python3 scripts/dap_smoke_test.py   # terminal 2
 ```
 
-The script installs `scripts/test-datapack` into the world, `/reload`s, and exercises the full debug loop end to end (86 checks): breakpoints, stepping, time travel (step back / reverse continue / historical state reconstruction), macro breakpoints and macro-argument values, comment-line shifting, live variable read/write (scoreboard, storage NBT, entity NBT), selector/coordinate resolution, hover evaluation, console completions, chat output mirroring, entity/block data requests, evaluate and pause. CI runs the same suite against a real dedicated server, and pushing a `v*` tag publishes the jar and vsix as a GitHub Release.
+The script installs `scripts/test-datapack` into the world, `/reload`s, and exercises the full debug loop end to end (108 checks): breakpoints, stepping, time travel (step back / reverse continue / historical state reconstruction), macro breakpoints and macro-argument values, comment-line shifting, live variable read/write (scoreboard, storage NBT, entity NBT), selector/coordinate resolution, hover evaluation, console completions, chat output mirroring, entity/block data requests, evaluate and pause. CI runs the same suite against a real dedicated server, and pushing a `v*` tag publishes the jar and vsix as a GitHub Release.
 
 ## Notes
 
+- Keep the mod and the VS Code extension on matching versions: the mod sends a `saddle/version` event on attach and the extension warns when the two drift apart (major.minor).
 - On dedicated servers set `max-tick-time=-1`: suspending at a breakpoint parks the server thread, which would otherwise trip the watchdog.
 - In singleplayer, the internal client may disconnect if the game stays suspended for a long time.
 - Stepping past the end of all queued commands leaves the session in the running state until the next breakpoint/pause hit (e.g. the next tick-function command).
@@ -97,4 +109,4 @@ The script installs `scripts/test-datapack` into the world, `/reload`s, and exer
 ## Troubleshooting
 
 - **Edits don't seem to apply / `data get` shows old values.** First check the attach announcement: on attach, Saddle prints `Saddle: debugger attached to world '…'` in the Debug Console and `[Saddle] Debugger attached` in the game chat. If the chat message does not appear in *your* world, another Minecraft instance with Saddle owns the port (its log shows `Failed to bind DAP server`) and your edits are landing in that instance — close it or use `-Dsaddle.port` to separate them. Also note that a tick function which rewrites a scoreboard/storage every tick will overwrite manual edits as soon as you resume.
-- The `Watched`/`Storage` scopes edit live data only; the "… (recorded)" time-travel scopes are read-only.
+- The `Watched`/`Storage` scopes edit live data only. While time-traveling, the same-named scopes show recorded values and are read-only — the `(time travel)` row in the Executor scope tells you which mode you are looking at.

@@ -78,11 +78,17 @@ final class CustomRequests {
     private static Map<String, Object> trace(Map<String, Object> args) {
         int count = Args.getInt(args, "count", 100);
         long head = TtdTrace.newestStep();
+        List<TtdTrace.Step> recent = TtdTrace.recent(count);
         List<Map<String, Object>> steps = new ArrayList<>();
-        for (TtdTrace.Step step : TtdTrace.recent(count)) {
+        for (int i = 0; i < recent.size(); i++) {
+            TtdTrace.Step step = recent.get(i);
+            // "behind" counts step-ring positions; Step.index() is the global
+            // sequence shared with score/storage deltas and must not be mixed
+            // with ring positions.
+            long behind = recent.size() - 1 - (long) i;
             Map<String, Object> item = new LinkedHashMap<>();
-            item.put("index", step.index());
-            item.put("behind", head - step.index());
+            item.put("index", head - behind);
+            item.put("behind", behind);
             item.put("function", step.functionId().toString());
             item.put("line", step.line());
             item.put("depth", step.depth());

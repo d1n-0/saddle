@@ -28,10 +28,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * variablesReference handle table for one DAP session. References are handed
- * out lazily while execution is suspended and invalidated on every stop or
- * resume. Node reads/writes run on the server thread (via the debugger's
- * pause-aware dispatcher), so they see live game state.
+ * variablesReference handle table for one DAP session. References are keyed
+ * by the node's structural identity ({@link Node#stableKey()}), so re-fetching
+ * scopes after an {@code invalidated} event or a time-travel move hands the
+ * client the same reference numbers — which is what lets VS Code keep rows
+ * expanded across value edits and history navigation. Node reads/writes run
+ * on the server thread (via the debugger's pause-aware dispatcher), so they
+ * see live game state.
  */
 final class VariableTree {
     private static final int FIRST_REF = 1000;
@@ -45,13 +48,34 @@ final class VariableTree {
         default String setChild(String name, String value) throws Exception {
             throw new UnsupportedOperationException("This value is read-only");
         }
+
+        /**
+         * Structural identity for reference reuse. Nodes with the same key
+         * replace each other under one reference number; null allocates a
+         * fresh reference on every registration.
+         */
+        default String stableKey() {
+            return null;
+        }
+
+        /** Whether {@link #setChild} is supported (drives edit UI hints). */
+        default boolean canEditChildren() {
+            return false;
+        }
     }
 
     private final AtomicInteger nextRef = new AtomicInteger(FIRST_REF);
     private final Map<Integer, Node> nodes = new ConcurrentHashMap<>();
+    private final Map<String, Integer> keyedRefs = new ConcurrentHashMap<>();
 
     int register(Node node) {
-        int ref = nextRef.getAndIncrement();
+        String key = node.stableKey();
+        if (key == null) {
+            int ref = nextRef.getAndIncrement();
+            nodes.put(ref, node);
+            return ref;
+        }
+        int ref = keyedRefs.computeIfAbsent(key, k -> nextRef.getAndIncrement());
         nodes.put(ref, node);
         return ref;
     }
@@ -60,9 +84,19 @@ final class VariableTree {
         return nodes.get(ref);
     }
 
-    void clear() {
-        nodes.clear();
-        nextRef.set(FIRST_REF);
+    /**
+     * Drops nodes tied to a specific suspension — their keys carry a "#"
+     * identity marker (frames, selectors, blocks, macro args). Called on each
+     * new stop so a long session cannot accumulate dead frames and entity
+     * references. Durable keys (scoreboard, storage, NBT paths) survive,
+     * preserving row expansion.
+     */
+    void pruneTransient() {
+        keyedRefs.entrySet().removeIf(entry -> {
+            if (entry.getKey().indexOf('#') < 0) return false;
+            nodes.remove(entry.getValue());
+            return true;
+        });
     }
 
     static Map<String, Object> leaf(String name, String value) {
@@ -101,8 +135,18 @@ final class VariableTree {
     // Node implementations
     // ------------------------------------------------------------------
 
+    /** Structural identity for a live stack frame within one suspension. */
+    private static String frameKey(StackSnapshot.Frame frame) {
+        return frame.functionId() + ":" + frame.line() + "#" + System.identityHashCode(frame);
+    }
+
     /** Frame scope: executor summary plus a live NBT subtree for the entity. */
     record ExecutorNode(StackSnapshot.Frame frame) implements Node {
+        @Override
+        public String stableKey() {
+            return "executor|" + frameKey(frame);
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) throws Exception {
             List<Map<String, Object>> result = new ArrayList<>();
@@ -122,6 +166,12 @@ final class VariableTree {
     /** Macro argument values for a {@code $...} frame; read-only. */
     record MacroArgsNode(Map<String, String> args) implements Node {
         @Override
+        public String stableKey() {
+            // "#" marks stop-local keys; see pruneTransient().
+            return "macroargs#" + System.identityHashCode(args);
+        }
+
+        @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
             args.forEach((key, value) -> result.add(leaf("$(" + key + ")", value)));
@@ -134,6 +184,11 @@ final class VariableTree {
      * triple it mentions resolved live against the frame's command source.
      */
     record CommandNode(StackSnapshot.Frame frame) implements Node {
+        @Override
+        public String stableKey() {
+            return "command|" + frameKey(frame);
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             String text = FunctionIndex.lineText(frame.functionId(), frame.line()).strip();
@@ -175,6 +230,11 @@ final class VariableTree {
     /** Entities matched by a selector; each expands into its live NBT. */
     record SelectorNode(String selector, Object source) implements Node {
         @Override
+        public String stableKey() {
+            return "selector|" + selector + "#" + System.identityHashCode(source);
+        }
+
+        @Override
         public List<Map<String, Object>> children(VariableTree tree) throws Exception {
             List<Map<String, Object>> result = new ArrayList<>();
             for (Entity entity : DebugTargets.selectEntities(selector, source)) {
@@ -191,6 +251,11 @@ final class VariableTree {
 
     /** Block at a resolved position: state plus block-entity NBT when present. */
     record BlockNode(BlockPos pos, Object source) implements Node {
+        @Override
+        public String stableKey() {
+            return "block|" + pos.toShortString() + "#" + System.identityHashCode(source);
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             CommandSourceStack css = DebugTargets.sourceOrServer(source);
@@ -254,20 +319,104 @@ final class VariableTree {
         }
         if (expr.startsWith("score ")) {
             String[] parts = expr.split("\\s+");
-            if (parts.length != 3) throw new IllegalArgumentException("Expected: score <objective> <holder>");
             var scoreboard = DebugSession.server().getScoreboard();
+            if (parts.length < 2 || parts.length > 3) {
+                throw new IllegalArgumentException("Expected: score <objective> [holder]");
+            }
             var objective = scoreboard.getObjective(parts[1]);
             if (objective == null) throw new IllegalArgumentException("Unknown objective: " + parts[1]);
+            if (parts.length == 2) {
+                // Whole objective: expandable, scores editable.
+                int count = scoreboard.listPlayerScores(objective).size();
+                return tree.container(expr, count + (count == 1 ? " score" : " scores"),
+                        new ObjectiveNode(parts[1]));
+            }
             var info = scoreboard.getPlayerScoreInfo(
                     net.minecraft.world.scores.ScoreHolder.forNameOnly(parts[2]), objective);
             return leaf(expr, info == null ? "(not set)" : String.valueOf(info.value()));
+        }
+        if (expr.equals("scoreboard")) {
+            int count = DebugSession.server().getScoreboard().getObjectives().size();
+            return tree.container(expr, count + (count == 1 ? " objective" : " objectives"),
+                    new ScoreboardNode());
+        }
+        if (expr.equals("storage")) {
+            long count = DebugSession.server().getCommandStorage().keys().count();
+            return tree.container(expr, count + (count == 1 ? " id" : " ids"), new StorageRootNode());
         }
         if (!DebugTargets.findCoordTriples(expr).isEmpty()) {
             return describeBlock(tree, expr, source);
         }
         throw new IllegalArgumentException(
-                "Cannot resolve: " + expr + " (try @selector, storage <id> [path], entity <uuid> [path],"
-                        + " block <x> <y> <z> [path], score <objective> <holder>, $(macroArg), or coordinates)");
+                "Cannot resolve: " + expr + " (try @selector, storage [<id> [path]], entity <uuid> [path],"
+                        + " block <x> <y> <z> [path], score <objective> [holder], scoreboard, $(macroArg),"
+                        + " or coordinates)");
+    }
+
+    /**
+     * Stateless resolution for the live-watch panel: resolves {@code expression}
+     * fresh, walks down {@code path} by child names, and describes that node's
+     * value and children without handing out variablesReferences. Usable while
+     * the game is running (no suspension required). Server thread only.
+     */
+    static Map<String, Object> resolveLive(String expression, List<String> path,
+            StackSnapshot.Frame frame) throws Exception {
+        VariableTree scratch = new VariableTree();
+        Map<String, Object> current = resolveExpression(scratch, expression, frame);
+        for (String name : path) {
+            Node node = scratch.get(refOf(current));
+            if (node == null) throw new IllegalArgumentException("Not expandable: " + current.get("name"));
+            current = node.children(scratch).stream()
+                    .filter(child -> name.equals(child.get("name")))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("No child named " + name));
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("name", current.get("name"));
+        result.put("value", current.get("value"));
+        Node node = scratch.get(refOf(current));
+        result.put("hasChildren", node != null);
+        if (node != null) {
+            boolean editable = node.canEditChildren();
+            List<Map<String, Object>> children = new ArrayList<>();
+            for (Map<String, Object> child : node.children(scratch)) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("name", child.get("name"));
+                item.put("value", child.get("value"));
+                item.put("hasChildren", refOf(child) != 0);
+                item.put("editable", editable);
+                children.add(item);
+            }
+            result.put("children", children);
+        } else {
+            result.put("children", List.of());
+        }
+        return result;
+    }
+
+    /**
+     * Stateless write for the live-watch panel: walks to the node at
+     * {@code parentPath} and sets its child {@code name}. Server thread only.
+     */
+    static String resolveLiveSet(String expression, List<String> parentPath, String name,
+            String value, StackSnapshot.Frame frame) throws Exception {
+        VariableTree scratch = new VariableTree();
+        Map<String, Object> current = resolveExpression(scratch, expression, frame);
+        for (String segment : parentPath) {
+            Node node = scratch.get(refOf(current));
+            if (node == null) throw new IllegalArgumentException("Not expandable: " + current.get("name"));
+            current = node.children(scratch).stream()
+                    .filter(child -> segment.equals(child.get("name")))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("No child named " + segment));
+        }
+        Node node = scratch.get(refOf(current));
+        if (node == null) throw new IllegalArgumentException("Not editable here: " + current.get("name"));
+        return node.setChild(name, value);
+    }
+
+    private static int refOf(Map<String, Object> variable) {
+        return variable.get("variablesReference") instanceof Number n ? n.intValue() : 0;
     }
 
     private static Map<String, Object> describeNbt(VariableTree tree, String name,
@@ -281,6 +430,11 @@ final class VariableTree {
 
     /** User-pinned expressions, re-resolved live on every request. */
     record WatchedNode(List<String> pins, StackSnapshot.Frame frame) implements Node {
+        @Override
+        public String stableKey() {
+            return "watched";
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
@@ -299,11 +453,17 @@ final class VariableTree {
     // Time-travel (recorded) nodes — all read-only
     // ------------------------------------------------------------------
 
-    /** Executor summary of a recorded step. */
-    record RecordedExecutorNode(TtdTrace.Step step) implements Node {
+    /** Executor summary of a recorded step, marked as time-travel data. */
+    record RecordedExecutorNode(TtdTrace.Step step, long stepsBehind) implements Node {
+        @Override
+        public String stableKey() {
+            return "rec-executor";
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
+            result.add(leaf("(time travel)", stepsBehind + " step(s) behind present — values are recorded, read-only"));
             TtdTrace.describeStep(step).forEach((name, value) -> result.add(leaf(name, value)));
             return result;
         }
@@ -311,6 +471,11 @@ final class VariableTree {
 
     /** The recorded command line text (targets are not re-resolved in the past). */
     record RecordedCommandNode(TtdTrace.Step step) implements Node {
+        @Override
+        public String stableKey() {
+            return "rec-command";
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             return List.of(leaf("command",
@@ -320,6 +485,11 @@ final class VariableTree {
 
     /** Scoreboard values reconstructed as of a recorded step. */
     record ScoreboardAtNode(long stepIndex) implements Node {
+        @Override
+        public String stableKey() {
+            return "rec-scoreboard";
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
@@ -331,6 +501,11 @@ final class VariableTree {
     }
 
     record ObjectiveAtNode(long stepIndex, String objective) implements Node {
+        @Override
+        public String stableKey() {
+            return "rec-objective|" + objective;
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
@@ -344,12 +519,17 @@ final class VariableTree {
     /** Command storage reconstructed as of a recorded step. */
     record StorageAtNode(long stepIndex) implements Node {
         @Override
+        public String stableKey() {
+            return "rec-storage";
+        }
+
+        @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
             for (var id : TtdTrace.storageIdsAt(stepIndex)) {
                 CompoundTag tag = TtdTrace.storageAt(stepIndex, id);
                 DataInspector.NbtTarget target = recordedTarget(stepIndex, id);
-                result.add(tree.container(id.toString(), preview(tag), new NbtNode(target, "")));
+                result.add(tree.container(id.toString(), preview(tag), new NbtNode(target, "", false)));
             }
             return result;
         }
@@ -368,13 +548,20 @@ final class VariableTree {
 
                 @Override
                 public String describe() {
-                    return "storage " + id + " @ step " + stepIndex;
+                    // No step index: keeps NbtNode keys stable across
+                    // time-travel moves so expanded rows survive navigation.
+                    return "recorded storage " + id;
                 }
             };
         }
     }
 
     record ScoreboardNode() implements Node {
+        @Override
+        public String stableKey() {
+            return "scoreboard";
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             Scoreboard scoreboard = DebugSession.server().getScoreboard();
@@ -391,6 +578,16 @@ final class VariableTree {
 
     /** Scores of one objective; values are writable (parsed as int). */
     record ObjectiveNode(String objectiveName) implements Node {
+        @Override
+        public boolean canEditChildren() {
+            return true;
+        }
+
+        @Override
+        public String stableKey() {
+            return "objective|" + objectiveName;
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             Scoreboard scoreboard = DebugSession.server().getScoreboard();
@@ -412,6 +609,11 @@ final class VariableTree {
 
     record StorageRootNode() implements Node {
         @Override
+        public String stableKey() {
+            return "storage";
+        }
+
+        @Override
         public List<Map<String, Object>> children(VariableTree tree) {
             List<Map<String, Object>> result = new ArrayList<>();
             DebugSession.server().getCommandStorage().keys().sorted(
@@ -426,10 +628,28 @@ final class VariableTree {
     }
 
     /**
-     * Live NBT tree over any {@link DataInspector.NbtTarget}. Leaf values are
-     * writable with SNBT; containers expand lazily.
+     * NBT tree over any {@link DataInspector.NbtTarget}; containers expand
+     * lazily. Leaf values accept SNBT edits unless the node is read-only
+     * (recorded time-travel state). The read-only check runs before any
+     * mutation — {@code DataInspector.setData} mutates the root before
+     * writing, so relying on the target's write() to reject edits would
+     * corrupt state first.
      */
-    record NbtNode(DataInspector.NbtTarget target, String path) implements Node {
+    record NbtNode(DataInspector.NbtTarget target, String path, boolean editable) implements Node {
+        NbtNode(DataInspector.NbtTarget target, String path) {
+            this(target, path, true);
+        }
+
+        @Override
+        public boolean canEditChildren() {
+            return editable;
+        }
+
+        @Override
+        public String stableKey() {
+            return "nbt|" + target.describe() + "|" + path;
+        }
+
         @Override
         public List<Map<String, Object>> children(VariableTree tree) throws Exception {
             Tag tag = DataInspector.getData(target, path);
@@ -449,13 +669,16 @@ final class VariableTree {
 
         private Map<String, Object> describe(VariableTree tree, String name, String fullPath, Tag tag) {
             if (tag instanceof CompoundTag || tag instanceof CollectionTag) {
-                return tree.container(name, preview(tag), new NbtNode(target, fullPath));
+                return tree.container(name, preview(tag), new NbtNode(target, fullPath, editable));
             }
             return leaf(name, preview(tag));
         }
 
         @Override
         public String setChild(String name, String value) throws Exception {
+            if (!editable) {
+                throw new UnsupportedOperationException("Recorded state is read-only");
+            }
             String fullPath = name.startsWith("[") ? path + name : childPath(name);
             return preview(DataInspector.setData(target, fullPath, value));
         }

@@ -20,6 +20,18 @@ public class Saddle implements ModInitializer {
 	public static final String MOD_ID = "saddle";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
+	/** The mod version, reported to DAP clients for compatibility warnings. */
+	public static String version() {
+		String version = net.fabricmc.loader.api.FabricLoader.getInstance()
+				.getModContainer(MOD_ID)
+				.map(container -> container.getMetadata().getVersion().getFriendlyString())
+				.orElse("unknown");
+		// IDE builds copy fabric.mod.json without Gradle's processResources
+		// expansion, leaving the literal placeholder; report "dev" so clients
+		// skip the mismatch warning instead of comparing against "${version}".
+		return version.contains("${") ? "dev" : version;
+	}
+
 	@Override
 	public void onInitialize() {
 		String host = System.getProperty("saddle.host", "127.0.0.1");
@@ -30,8 +42,15 @@ public class Saddle implements ModInitializer {
 			DapServer.start(host, port);
 		});
 
+		ServerLifecycleEvents.START_DATA_PACK_RELOAD.register(
+				(server, resourceManager) -> FunctionIndex.beginReload());
+
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) -> {
-			if (success) pruneRemovedFunctions(server);
+			if (success) {
+				commitReload(server);
+			} else {
+				FunctionIndex.discardReload();
+			}
 		});
 
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
@@ -40,10 +59,10 @@ public class Saddle implements ModInitializer {
 		});
 	}
 
-	private static void pruneRemovedFunctions(MinecraftServer server) {
+	private static void commitReload(MinecraftServer server) {
 		Set<Identifier> live = new HashSet<>();
 		server.getFunctions().getFunctionNames().forEach(live::add);
-		FunctionIndex.retainAll(live);
+		FunctionIndex.commitReload(live);
 		BreakpointManager.retainAll(live);
 	}
 }

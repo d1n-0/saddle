@@ -247,7 +247,10 @@ public final class TtdTrace {
                     frames.add(step);
                     wantedDepth--;
                 } else if (step.depth < wantedDepth) {
-                    break; // caller chain left the recording window
+                    // Depth gap — execute-style forks can skip levels; the
+                    // nearest shallower step is still the caller.
+                    frames.add(step);
+                    wantedDepth = step.depth - 1;
                 }
             }
             return frames;
@@ -330,7 +333,9 @@ public final class TtdTrace {
                 }
             }
         }
-        return tag;
+        // Defensive copy: the result may be the live storage tag or a buffer
+        // entry; a caller mutating it must not corrupt either.
+        return tag.copy();
     }
 
     /** Executor summary leaves for a recorded step. */

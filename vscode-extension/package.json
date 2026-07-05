@@ -2,7 +2,7 @@
 	"name": "saddle-debug",
 	"displayName": "Saddle — Minecraft Datapack Debugger",
 	"description": "Debug Minecraft datapack .mcfunction files through the Saddle mod: breakpoints (incl. macro lines), stepping, call stacks, live scoreboard/storage/entity NBT editing and a command console.",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"publisher": "d1n0",
 	"license": "MIT",
 	"icon": "icon.png",
@@ -19,6 +19,41 @@
 		"onLanguage:mcfunction"
 	],
 	"contributes": {
+		"views": {
+			"debug": [
+				{
+					"type": "webview",
+					"id": "saddleLiveWatch",
+					"name": "Saddle Watch",
+					"when": "inDebugMode"
+				}
+			]
+		},
+		"configuration": {
+			"title": "Saddle",
+			"properties": {
+				"saddle.liveWatchRefreshInterval": {
+					"type": "number",
+					"default": 1000,
+					"minimum": 200,
+					"description": "Refresh interval (ms) for the Saddle Live Watch view."
+				}
+			}
+		},
+		"menus": {
+			"view/title": [
+				{
+					"command": "saddle.pin",
+					"when": "view == saddleLiveWatch",
+					"group": "navigation@1"
+				},
+				{
+					"command": "saddle.liveRefresh",
+					"when": "view == saddleLiveWatch",
+					"group": "navigation@2"
+				}
+			]
+		},
 		"languages": [
 			{
 				"id": "mcfunction",
@@ -118,11 +153,17 @@
 			},
 			{
 				"command": "saddle.pin",
-				"title": "Saddle: Watch Expression (Pin to Variables)"
+				"title": "Saddle: Watch Expression (Pin to Variables)",
+				"icon": "$(add)"
 			},
 			{
 				"command": "saddle.unpin",
 				"title": "Saddle: Unpin Watched Expression"
+			},
+			{
+				"command": "saddle.liveRefresh",
+				"title": "Saddle: Refresh Live Watch",
+				"icon": "$(refresh)"
 			}
 		]
 	}

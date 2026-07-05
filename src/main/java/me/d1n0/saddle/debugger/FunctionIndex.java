@@ -35,25 +35,48 @@ public final class FunctionIndex {
 
     private FunctionIndex() {}
 
+    /**
+     * Staging area for an in-flight datapack reload. While non-null, freshly
+     * parsed functions land here and readers keep serving the committed maps;
+     * the staging is committed only when the reload succeeds, so a failed
+     * reload (vanilla keeps running the old packs) never leaves the index
+     * describing functions that were never applied.
+     */
+    private static volatile Map<Identifier, Entry> staging;
+
     /** Called at the start of parsing; replaces any data from a previous (re)load. */
     public static void beginFunction(Identifier id, List<String> rawLines) {
-        FUNCTIONS.put(id, new Entry(List.copyOf(rawLines), new BitSet(rawLines.size() + 1)));
+        Map<Identifier, Entry> target = staging;
+        (target != null ? target : FUNCTIONS)
+                .put(id, new Entry(List.copyOf(rawLines), new BitSet(rawLines.size() + 1)));
     }
 
-    /**
-     * Drops functions that no longer exist after a datapack reload, so
-     * breakpoint verification and source display cannot succeed against stale
-     * definitions. sourceReference ids are kept — they must stay stable for
-     * sources the client may still hold.
-     */
-    public static void retainAll(java.util.Set<Identifier> liveFunctions) {
+    /** A /reload started: buffer new parses until the outcome is known. */
+    public static void beginReload() {
+        staging = new ConcurrentHashMap<>();
+    }
+
+    /** Reload succeeded: publish staged functions, drop removed ones. */
+    public static void commitReload(java.util.Set<Identifier> liveFunctions) {
+        Map<Identifier, Entry> staged = staging;
+        if (staged != null) {
+            FUNCTIONS.putAll(staged);
+            staging = null;
+        }
         FUNCTIONS.keySet().retainAll(liveFunctions);
         CLIENT_PATHS.keySet().retainAll(liveFunctions);
     }
 
+    /** Reload failed: the old packs stay live, so the staged parses are void. */
+    public static void discardReload() {
+        staging = null;
+    }
+
     /** Marks a line that maps to a runtime entry (plain command or macro line). */
     public static void recordBreakableLine(Identifier id, int line) {
-        Entry entry = FUNCTIONS.get(id);
+        Map<Identifier, Entry> target = staging;
+        Entry entry = target != null ? target.get(id) : null;
+        if (entry == null) entry = FUNCTIONS.get(id);
         if (entry != null && line >= 1) {
             entry.breakableLines.set(line);
         }

@@ -36,6 +36,7 @@ class DapClient:
         self.events = queue.Queue()
         self.responses = {}
         self.responses_cv = threading.Condition()
+        self.send_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read_loop, daemon=True)
         self.reader.start()
 
@@ -73,13 +74,14 @@ class DapClient:
             pass
 
     def request(self, command, arguments=None, expect_success=True, timeout=None):
-        self.seq += 1
-        req_seq = self.seq
-        msg = {"type": "request", "seq": req_seq, "command": command}
-        if arguments is not None:
-            msg["arguments"] = arguments
-        body = json.dumps(msg).encode("utf-8")
-        self.sock.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        with self.send_lock:
+            self.seq += 1
+            req_seq = self.seq
+            msg = {"type": "request", "seq": req_seq, "command": command}
+            if arguments is not None:
+                msg["arguments"] = arguments
+            body = json.dumps(msg).encode("utf-8")
+            self.sock.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
         deadline = time.monotonic() + (timeout or self.timeout)
         with self.responses_cv:
             while req_seq not in self.responses:
@@ -180,6 +182,8 @@ def main():
         check(resp["body"].get("supportsConfigurationDoneRequest") is True, "initialize capabilities")
         client.wait_event("initialized", timeout=5)
         check(True, "initialized event received")
+        version = client.wait_event("saddle/version", timeout=5)["body"]["version"]
+        check(version == "1.1.0", "mod reports its version for compatibility checks", version)
         client.request("attach", {})
 
         print("== load test datapack ==")
@@ -279,9 +283,13 @@ def main():
 
         scopes = client.request("scopes", {"frameId": frames[0]["id"]})["body"]["scopes"]
         names = [s["name"] for s in scopes]
-        check("Scoreboard (recorded)" in names and "Storage (recorded)" in names,
-              "recorded scopes present", str(names))
-        sb_ref = next(s["variablesReference"] for s in scopes if s["name"] == "Scoreboard (recorded)")
+        check("Scoreboard" in names and "Storage" in names and "(recorded)" not in str(names),
+              "history scopes keep live names (expansion survives)", str(names))
+        exec_ref = next(s["variablesReference"] for s in scopes if s["name"] == "Executor")
+        exec_vars = client.request("variables", {"variablesReference": exec_ref})["body"]["variables"]
+        check(any(v["name"] == "(time travel)" for v in exec_vars),
+              "executor scope carries time-travel marker", str(exec_vars))
+        sb_ref = next(s["variablesReference"] for s in scopes if s["name"] == "Scoreboard")
         objectives = client.request("variables", {"variablesReference": sb_ref})["body"]["variables"]
         dbg = next((o for o in objectives if o["name"] == "saddle_dbg"), None)
         check(dbg is not None, "recorded scoreboard objective", str(objectives))
@@ -316,6 +324,10 @@ def main():
         trace = client.request("saddle/trace", {"count": 50})["body"]["steps"]
         check(len(trace) >= 5 and any(s["function"] == "saddle_test:sub" for s in trace),
               "execution trace request", f"{len(trace)} steps")
+        behinds = [s["behind"] for s in trace]
+        check(behinds == sorted(behinds, reverse=True) and behinds[-1] == 0
+              and all(b >= 0 for b in behinds),
+              "trace behind counts step positions", str(behinds[:8]))
 
         print("== storage time travel ==")
         # ttd.mcfunction writes v:1 (line 2) then v:2 (line 3). Stopped at
@@ -332,7 +344,7 @@ def main():
         client.request("stepBack", {"threadId": 1})
         client.wait_event("stopped")
         scopes = client.request("scopes", {"frameId": 1})["body"]["scopes"]
-        rec_ref = next(s["variablesReference"] for s in scopes if s["name"] == "Storage (recorded)")
+        rec_ref = next(s["variablesReference"] for s in scopes if s["name"] == "Storage")
         stores = client.request("variables", {"variablesReference": rec_ref})["body"]["variables"]
         ttd_store = next((s for s in stores if s["name"] == "saddle_test:ttd"), None)
         check(ttd_store is not None, "recorded storage id present", str(stores))
@@ -341,6 +353,17 @@ def main():
         v = next((x for x in values if x["name"] == "v"), None)
         check(v is not None and v["value"] == "1",
               "storage reconstructed to pre-write value", str(values))
+        # Recorded state must reject edits without touching history or live data.
+        resp = client.request("setVariable", {
+            "variablesReference": ttd_store["variablesReference"], "name": "v", "value": "999",
+        }, expect_success=False)
+        check(not resp.get("success"), "recorded storage rejects edits", str(resp.get("message")))
+        values = client.request("variables",
+                                {"variablesReference": ttd_store["variablesReference"]})["body"]["variables"]
+        v = next((x for x in values if x["name"] == "v"), None)
+        check(v is not None and v["value"] == "1", "history unchanged after rejected edit", str(values))
+        result = evaluate(client, "data get storage saddle_test:ttd v")
+        check("2" in result, "live storage unchanged after rejected edit", result)
         client.request("continue", {"threadId": 1})
         time.sleep(0.3)
         client.request("setBreakpoints", {"source": {"path": ttd_fn}, "breakpoints": []})
@@ -627,6 +650,100 @@ def main():
                                   {"variablesReference": nbt["variablesReference"]})["body"]["variables"]
         check(any(v["name"] == "Pos" for v in nbt_vars), "entity NBT tree expands", str(nbt_vars)[:200])
         client.request("continue", {"threadId": 1})
+        client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": []})
+
+        print("== execute-run tracing ==")
+        # Let the previous section's resumed run finish before arming the sub
+        # breakpoint, or it would catch main's own sub call instead of exec's.
+        time.sleep(0.8)
+        sub_fn = os.path.join(pack_dir, "data", "saddle_test", "function", "sub.mcfunction")
+        client.request("setBreakpoints", {"source": {"path": sub_fn}, "breakpoints": [{"line": 2}]})
+        evaluate(client, "function saddle_test:exec")
+        stopped = client.wait_event("stopped")
+        check(stopped["body"]["reason"] == "breakpoint", "breakpoint hits inside execute-run callee")
+        frames = top_frame(client)
+        check(frames[0]["name"] == "saddle_test:sub" and frames[0]["line"] == 2,
+              "stopped in callee at line 2", str(frames[0]))
+        check(any(f["name"] == "saddle_test:exec" for f in frames),
+              "execute-run caller frame visible in stack", str([f["name"] for f in frames]))
+
+        print("== stable variable references ==")
+        scopes1 = client.request("scopes", {"frameId": frames[0]["id"]})["body"]["scopes"]
+        scopes2 = client.request("scopes", {"frameId": frames[0]["id"]})["body"]["scopes"]
+        check([s["variablesReference"] for s in scopes1] == [s["variablesReference"] for s in scopes2],
+              "scope references stable across re-fetch")
+        sb_ref = next(s["variablesReference"] for s in scopes1 if s["name"] == "Scoreboard")
+        objs1 = client.request("variables", {"variablesReference": sb_ref})["body"]["variables"]
+        dbg1 = next(o for o in objs1 if o["name"] == "saddle_dbg")
+        client.request("setVariable", {"variablesReference": dbg1["variablesReference"],
+                                       "name": "target", "value": "7"})
+        client.wait_event("invalidated", timeout=5)
+        objs2 = client.request("variables", {"variablesReference": sb_ref})["body"]["variables"]
+        dbg2 = next(o for o in objs2 if o["name"] == "saddle_dbg")
+        check(dbg1["variablesReference"] == dbg2["variablesReference"],
+              "container reference stable across setVariable")
+
+        # TTD stack must tolerate execute-style depth gaps.
+        client.request("stepBack", {"threadId": 1})
+        client.wait_event("stopped")
+        frames = top_frame(client)
+        check(any(f["name"] == "saddle_test:exec" for f in frames),
+              "time-travel stack bridges execute depth gap", str([f["name"] for f in frames]))
+
+        print("== live watch ==")
+        live = client.request("saddle/live", {"expression": "score saddle_dbg", "path": []})["body"]
+        check(live["hasChildren"] and any(c["name"] == "target" for c in live["children"]),
+              "objective-only live watch while stopped", str(live))
+        watch = client.request("evaluate", {"expression": "score saddle_dbg", "context": "watch",
+                                            "frameId": frames[0]["id"]})["body"]
+        check(watch.get("variablesReference", 0) > 0, "objective-only watch expandable", str(watch))
+
+        client.request("continue", {"threadId": 1})
+        time.sleep(0.5)
+        client.request("setBreakpoints", {"source": {"path": sub_fn}, "breakpoints": []})
+        # Live watch keeps working while the game is running (no suspension).
+        live = client.request("saddle/live", {"expression": "scoreboard", "path": ["saddle_dbg"]})["body"]
+        check(any(c["name"] == "target" for c in live["children"]),
+              "scoreboard live watch while running", str(live))
+        live = client.request("saddle/live", {"expression": "storage saddle_test:store", "path": ["foo"]})["body"]
+        check(any(c["name"] == "bar" for c in live["children"]),
+              "storage live watch while running", str(live))
+        check(all(c.get("editable") for c in live["children"]),
+              "live watch marks NBT children editable", str(live))
+        client.request("saddle/liveSet", {"expression": "storage saddle_test:store",
+                                          "path": ["foo"], "name": "bar", "value": "63"})
+        result = evaluate(client, "data get storage saddle_test:store foo.bar")
+        check("63" in result, "live watch edit applies to the game", result)
+        live = client.request("saddle/live", {"expression": "score saddle_dbg", "path": []})["body"]
+        check(all(c.get("editable") for c in live["children"]),
+              "live watch marks scores editable", str(live))
+        client.request("saddle/liveSet", {"expression": "score saddle_dbg",
+                                          "path": [], "name": "target", "value": "77"})
+        result = evaluate(client, "scoreboard players get target saddle_dbg")
+        check("77" in result, "live watch score edit applies", result)
+
+        print("== async evaluate responsiveness ==")
+        client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": [{"line": 4}]})
+        result_holder = {}
+
+        def fire_evaluate():
+            try:
+                result_holder["resp"] = client.request(
+                    "evaluate", {"expression": "function saddle_test:main", "context": "repl"},
+                    timeout=15)
+            except Exception as e:
+                result_holder["error"] = e
+
+        evaluate_thread = threading.Thread(target=fire_evaluate, daemon=True)
+        evaluate_thread.start()
+        client.wait_event("stopped")
+        t0 = time.monotonic()
+        top_frame(client)
+        elapsed = time.monotonic() - t0
+        check(elapsed < 1.5, "stackTrace responsive while evaluate pending", f"{elapsed:.2f}s")
+        client.request("continue", {"threadId": 1})
+        evaluate_thread.join(timeout=10)
+        check("resp" in result_holder, "pending evaluate eventually responds", str(result_holder))
         client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": []})
 
         print("== disconnect ==")

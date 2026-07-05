@@ -24,6 +24,27 @@ public final class DapServer {
 
     public static synchronized void start(String host, int port) {
         if (acceptThread != null && acceptThread.isAlive()) return;
+        // The DAP protocol has no authentication and grants full command
+        // execution; never expose it beyond loopback unless the operator
+        // explicitly opts in.
+        try {
+            if (!java.net.InetAddress.getByName(host).isLoopbackAddress()) {
+                if (!Boolean.getBoolean("saddle.allowRemote")) {
+                    LOGGER.error("Refusing to bind the DAP server to non-loopback address {} — "
+                            + "anyone who can reach that port gets unauthenticated command execution. "
+                            + "Set -Dsaddle.allowRemote=true only on a trusted network; "
+                            + "falling back to 127.0.0.1.", host);
+                    host = "127.0.0.1";
+                } else {
+                    LOGGER.warn("DAP server binding to non-loopback address {} "
+                            + "(-Dsaddle.allowRemote=true): the debug port allows unauthenticated "
+                            + "command execution — make sure the network is trusted or tunneled.", host);
+                }
+            }
+        } catch (IOException e) {
+            LOGGER.error("Cannot resolve DAP host '{}'", host, e);
+            return;
+        }
         ServerSocket socket;
         try {
             socket = new ServerSocket();

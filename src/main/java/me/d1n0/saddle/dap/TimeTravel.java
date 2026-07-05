@@ -100,14 +100,18 @@ final class TimeTravel {
         List<TtdTrace.Step> stack = TtdTrace.stackAt(cursor);
         if (frameId < 1 || frameId > stack.size()) return Map.of("scopes", List.of());
         TtdTrace.Step step = stack.get(frameId - 1);
+        long behind = TtdTrace.newestStep() - cursor;
+        // Scope names match the live ones on purpose: VS Code restores row
+        // expansion by name, so switching between present and history keeps
+        // the tree open. The Executor scope carries the time-travel marker.
         List<Map<String, Object>> scopes = new ArrayList<>();
-        scopes.add(scope("Executor", new VariableTree.RecordedExecutorNode(step), false));
+        scopes.add(scope("Executor", new VariableTree.RecordedExecutorNode(step, behind), false));
         if (!step.macroArgs().isEmpty()) {
             scopes.add(scope("Macro Arguments", new VariableTree.MacroArgsNode(step.macroArgs()), false));
         }
         scopes.add(scope("Command", new VariableTree.RecordedCommandNode(step), false));
-        scopes.add(scope("Scoreboard (recorded)", new VariableTree.ScoreboardAtNode(cursor), true));
-        scopes.add(scope("Storage (recorded)", new VariableTree.StorageAtNode(cursor), true));
+        scopes.add(scope("Scoreboard", new VariableTree.ScoreboardAtNode(cursor), true));
+        scopes.add(scope("Storage", new VariableTree.StorageAtNode(cursor), true));
         return Map.of("scopes", scopes);
     }
 
@@ -122,7 +126,6 @@ final class TimeTravel {
     private void travelTo(long target, String reason) {
         long head = TtdTrace.newestStep();
         cursor = target >= head ? -1 : target;
-        variables.clear();
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("reason", reason);
         body.put("threadId", DapSession.THREAD_ID);

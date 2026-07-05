@@ -64,10 +64,15 @@ final class DapSession implements DebugSession.Listener, Closeable {
     }
 
     void run() {
-        DebugSession.attach(this);
-        // Seed the score shadow so time-travel deltas have before-values.
+        // Prime the score shadow and attach in one server-thread task:
+        // recording starts (armed) in the same tick the shadow is seeded, so
+        // no score write can slip in between and record a wrong before-value.
         DebugSession.callOnServerThread(() -> {
             TtdTrace.primeScoreboard();
+            if (!closed) {
+                DebugSession.attach(this);
+                if (closed) DebugSession.detach(this);
+            }
             return null;
         });
         try {
@@ -103,7 +108,10 @@ final class DapSession implements DebugSession.Listener, Closeable {
 
     @Override
     public void onStopped(String reason, StackSnapshot snapshot) {
-        variables.clear();
+        // Old frames/selectors/entities die with the previous suspension;
+        // durable references (scoreboard, storage, NBT paths) survive so
+        // expanded rows stay open.
+        variables.pruneTransient();
         timeTravel.reset();
         sendEvent("stopped", Map.of(
                 "reason", reason,
@@ -141,6 +149,8 @@ final class DapSession implements DebugSession.Listener, Closeable {
                 case "initialize" -> {
                     respond(requestSeq, command, capabilities());
                     sendEvent("initialized", Map.of());
+                    // Lets the extension warn when its version drifts from the mod's.
+                    sendEvent("saddle/version", Map.of("version", me.d1n0.saddle.Saddle.version()));
                 }
                 case "attach", "launch" -> {
                     respond(requestSeq, command, Map.of());
@@ -161,7 +171,6 @@ final class DapSession implements DebugSession.Listener, Closeable {
                 case "continue" -> {
                     respond(requestSeq, command, Map.of("allThreadsContinued", true));
                     if (!timeTravel.active() || !timeTravel.forwardContinue()) {
-                        variables.clear();
                         DebugSession.resume(null);
                     }
                 }
@@ -182,7 +191,16 @@ final class DapSession implements DebugSession.Listener, Closeable {
                     DebugSession.requestPause();
                     respond(requestSeq, command, Map.of());
                 }
-                case "evaluate" -> respond(requestSeq, command, handleEvaluate(args));
+                case "evaluate" -> {
+                    String expression = Args.requireString(args, "expression");
+                    String context = Args.getString(args, "context");
+                    if ("hover".equals(context) || "watch".equals(context)) {
+                        respond(requestSeq, command,
+                                handleInspectEvaluate(expression.trim(), Args.getInt(args, "frameId", 0)));
+                    } else {
+                        handleCommandEvaluate(requestSeq, command, expression);
+                    }
+                }
                 case "completions" -> respond(requestSeq, command, handleCompletions(args));
                 case "disconnect" -> {
                     respond(requestSeq, command, Map.of());
@@ -201,6 +219,26 @@ final class DapSession implements DebugSession.Listener, Closeable {
                     invalidateVariables();
                 }
                 case "saddle/pins" -> respond(requestSeq, command, Map.of("pins", List.copyOf(pins)));
+                // Stateless live inspection for the extension's watch panel:
+                // works while the game is running, no variablesReferences.
+                case "saddle/live" -> {
+                    String expression = Args.requireString(args, "expression");
+                    List<String> path = argPath(args);
+                    StackSnapshot.Frame frame = innermostFrame();
+                    respond(requestSeq, command, onServerThread(
+                            () -> VariableTree.resolveLive(expression, path, frame)));
+                }
+                case "saddle/liveSet" -> {
+                    String expression = Args.requireString(args, "expression");
+                    List<String> path = argPath(args);
+                    String name = Args.requireString(args, "name");
+                    String value = Args.requireString(args, "value");
+                    StackSnapshot.Frame frame = innermostFrame();
+                    String newValue = onServerThread(
+                            () -> VariableTree.resolveLiveSet(expression, path, name, value, frame));
+                    respond(requestSeq, command, Map.of("value", newValue));
+                    invalidateVariables();
+                }
                 default -> respondError(requestSeq, command, "Unsupported request: " + command);
             }
         } catch (Exception e) {
@@ -235,7 +273,6 @@ final class DapSession implements DebugSession.Listener, Closeable {
         StackSnapshot snapshot = DebugSession.currentSnapshot();
         int baseDepth = snapshot != null ? snapshot.stoppedDepth() : 0;
         respond(requestSeq, command, Map.of());
-        variables.clear();
         DebugSession.resume(new StepRequest(mode, baseDepth));
     }
 
@@ -243,6 +280,17 @@ final class DapSession implements DebugSession.Listener, Closeable {
         if (!DebugSession.isSuspended()) {
             throw new IllegalStateException("Execution is not stopped");
         }
+    }
+
+    private static List<String> argPath(Map<String, Object> args) {
+        return args.get("path") instanceof List<?> l
+                ? l.stream().map(String::valueOf).toList() : List.of();
+    }
+
+    private static StackSnapshot.Frame innermostFrame() {
+        StackSnapshot snapshot = DebugSession.currentSnapshot();
+        return snapshot != null && !snapshot.frames().isEmpty()
+                ? snapshot.frames().getFirst() : null;
     }
 
     // ------------------------------------------------------------------
@@ -356,29 +404,42 @@ final class DapSession implements DebugSession.Listener, Closeable {
     // Evaluate & completions
     // ------------------------------------------------------------------
 
-    private Map<String, Object> handleEvaluate(Map<String, Object> args) throws Exception {
-        String expression = Args.requireString(args, "expression");
-        String context = Args.getString(args, "context");
-        if ("hover".equals(context) || "watch".equals(context)) {
-            return handleInspectEvaluate(expression.trim(), Args.getInt(args, "frameId", 0));
-        }
-        try {
-            CommandRunner.Result result = DebugSession
-                    .callOnServerThread(() -> CommandRunner.run(expression))
-                    .get(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            if (DebugSession.isSuspended()) {
-                // Console commands may have changed watched game state.
-                invalidateVariables();
-            }
-            String text = result.output().isEmpty()
-                    ? (result.success() ? "= " + result.value() : "(command failed)")
-                    : result.output();
-            return Map.of("result", text, "variablesReference", 0);
-        } catch (TimeoutException e) {
-            return Map.of(
-                    "result", "(no result: the command is still running — it may have hit a breakpoint)",
-                    "variablesReference", 0);
-        }
+    /**
+     * Console evaluation responds asynchronously: a command that hits a
+     * breakpoint never completes its future, and blocking the session thread
+     * on it would stall the stackTrace/scopes requests VS Code sends right
+     * after the stopped event — the debugger would feel seconds slower than
+     * it is.
+     */
+    private void handleCommandEvaluate(int requestSeq, String command, String expression) {
+        DebugSession.callOnServerThread(() -> CommandRunner.run(expression))
+                .orTimeout(EVALUATE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .whenComplete((result, error) -> {
+                    try {
+                        if (error != null) {
+                            Throwable cause = error.getCause() != null ? error.getCause() : error;
+                            if (cause instanceof TimeoutException || error instanceof TimeoutException) {
+                                respond(requestSeq, command, Map.of(
+                                        "result", "(no result: the command is still running — it may have hit a breakpoint)",
+                                        "variablesReference", 0));
+                            } else {
+                                respondError(requestSeq, command,
+                                        cause.getMessage() != null ? cause.getMessage() : cause.toString());
+                            }
+                            return;
+                        }
+                        if (DebugSession.isSuspended()) {
+                            // Console commands may have changed watched game state.
+                            invalidateVariables();
+                        }
+                        String text = result.output().isEmpty()
+                                ? (result.success() ? "= " + result.value() : "(command failed)")
+                                : result.output();
+                        respond(requestSeq, command, Map.of("result", text, "variablesReference", 0));
+                    } catch (IOException ignored) {
+                        // Session is closing; nothing to deliver to.
+                    }
+                });
     }
 
     /**
