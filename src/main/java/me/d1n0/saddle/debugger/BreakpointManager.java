@@ -10,7 +10,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Verified breakpoints, keyed by function id and 1-based source line.
  * BitSets are built fresh on every update and never mutated after being
- * published, so lock-free reads from the command hot path are safe.
+ * published, so lock-free reads from the command hot path are safe. Writers
+ * (the DAP session thread and post-reload cleanup on the server thread) are
+ * synchronized so the {@code anySet} fast-path flag always matches the map.
  */
 public final class BreakpointManager {
     private static final Map<Identifier, BitSet> BREAKPOINTS = new ConcurrentHashMap<>();
@@ -18,7 +20,7 @@ public final class BreakpointManager {
 
     private BreakpointManager() {}
 
-    public static void set(Identifier functionId, Collection<Integer> lines) {
+    public static synchronized void set(Identifier functionId, Collection<Integer> lines) {
         if (lines.isEmpty()) {
             BREAKPOINTS.remove(functionId);
         } else {
@@ -37,13 +39,13 @@ public final class BreakpointManager {
         return bits != null && line >= 0 && bits.get(line);
     }
 
-    public static void clearAll() {
+    public static synchronized void clearAll() {
         BREAKPOINTS.clear();
         anySet = false;
     }
 
     /** Drops breakpoints for functions removed by a datapack reload. */
-    public static void retainAll(java.util.Set<Identifier> liveFunctions) {
+    public static synchronized void retainAll(java.util.Set<Identifier> liveFunctions) {
         BREAKPOINTS.keySet().retainAll(liveFunctions);
         anySet = !BREAKPOINTS.isEmpty();
     }

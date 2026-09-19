@@ -114,6 +114,17 @@ final class VariableTree {
     }
 
     /**
+     * Attaches the DAP {@code evaluateName}: a standalone watch expression
+     * that resolves to the same live value, so the node can be watched on its
+     * own (VS Code's "Add to Watch", Saddle Watch's context menu). Null leaves
+     * the variable unwatchable.
+     */
+    static Map<String, Object> watchable(Map<String, Object> variable, String expression) {
+        if (expression != null) variable.put("evaluateName", expression);
+        return variable;
+    }
+
+    /**
      * Cheap one-line summary. Containers are described by size instead of
      * being serialized — stringifying large NBT trees on every variables
      * request is what made big storages slow to browse.
@@ -157,7 +168,8 @@ final class VariableTree {
                 DataInspector.NbtTarget target =
                         DataInspector.entityTarget(UUID.fromString(frame.entityUuid()));
                 Tag data = DataInspector.getData(target, "");
-                result.add(tree.container("nbt", preview(data), new NbtNode(target, "")));
+                result.add(watchable(tree.container("nbt", preview(data), new NbtNode(target, "")),
+                        target.watchExpression("")));
             }
             return result;
         }
@@ -239,11 +251,12 @@ final class VariableTree {
             List<Map<String, Object>> result = new ArrayList<>();
             for (Entity entity : DebugTargets.selectEntities(selector, source)) {
                 if (result.size() >= MAX_CHILDREN) break;
-                result.add(tree.container(
+                DataInspector.NbtTarget target = DataInspector.entityTarget(entity.getUUID());
+                result.add(watchable(tree.container(
                         "[" + result.size() + "] " + entity.getName().getString(),
                         net.minecraft.core.registries.BuiltInRegistries.ENTITY_TYPE
                                 .getKey(entity.getType()) + " " + entity.getUUID(),
-                        new NbtNode(DataInspector.entityTarget(entity.getUUID()), "")));
+                        new NbtNode(target, "")), target.watchExpression("")));
             }
             return result;
         }
@@ -279,7 +292,8 @@ final class VariableTree {
     /**
      * Resolves a watch/pin expression against live game state (server thread).
      * Supported forms: {@code $(macroArg)}, {@code @selector}, coordinate
-     * triples, {@code storage <id> [path]}, {@code entity <uuid> [path]},
+     * triples, {@code storage <id> [path]}, {@code entity <target> [path]}
+     * (player name, UUID or single-entity selector, as in /data get entity),
      * {@code block <x> <y> <z> [path]}, {@code score <objective> <holder>}.
      */
     static Map<String, Object> resolveExpression(VariableTree tree, String rawExpr,
@@ -296,23 +310,16 @@ final class VariableTree {
         if (expr.startsWith("@")) {
             return describeSelector(tree, expr, source);
         }
-        if (expr.startsWith("storage ") || expr.startsWith("entity ")) {
-            String[] parts = expr.split("\\s+", 3);
-            if (parts.length < 2) throw new IllegalArgumentException("Expected: " + parts[0] + " <target> [path]");
-            String path = parts.length > 2 ? parts[2] : "";
-            DataInspector.NbtTarget target = DataInspector.resolveTarget(parts[0], parts[1]);
-            return describeNbt(tree, expr, target, path);
+        NbtRef nbt = nbtRef(expr, source);
+        if (nbt != null) {
+            return describeNbt(tree, expr, nbt.target(), nbt.path());
         }
         if (expr.startsWith("block ")) {
+            // Without a path: the block itself (state plus block-entity NBT).
             String[] parts = expr.split("\\s+");
-            if (parts.length < 4) throw new IllegalArgumentException("Expected: block <x> <y> <z> [path]");
-            net.minecraft.core.BlockPos pos = DebugTargets.resolveBlockPos(
-                    parts[1] + " " + parts[2] + " " + parts[3], source);
+            if (parts.length != 4) throw new IllegalArgumentException("Expected: block <x> <y> <z> [path]");
+            BlockPos pos = DebugTargets.resolveBlockPos(parts[1] + " " + parts[2] + " " + parts[3], source);
             CommandSourceStack css = DebugTargets.sourceOrServer(source);
-            if (parts.length > 4) {
-                String path = String.join(" ", java.util.Arrays.copyOfRange(parts, 4, parts.length));
-                return describeNbt(tree, expr, DataInspector.blockTarget(css.getLevel(), pos), path);
-            }
             return tree.container(expr,
                     pos.toShortString() + " = " + DataInspector.describeBlockState(css.getLevel(), pos),
                     new BlockNode(pos, source));
@@ -348,9 +355,71 @@ final class VariableTree {
             return describeBlock(tree, expr, source);
         }
         throw new IllegalArgumentException(
-                "Cannot resolve: " + expr + " (try @selector, storage [<id> [path]], entity <uuid> [path],"
+                "Cannot resolve: " + expr + " (try @selector, storage [<id> [path]], entity <player|uuid|@selector> [path],"
                         + " block <x> <y> <z> [path], score <objective> [holder], scoreboard, $(macroArg),"
                         + " or coordinates)");
+    }
+
+    /** The NBT a storage/entity/block expression addresses. */
+    private record NbtRef(DataInspector.NbtTarget target, String path) {}
+
+    /**
+     * Parses {@code storage <id> [path]}, {@code entity <target> [path]} and
+     * {@code block <x> <y> <z> <path>}; null for every other form, including
+     * a block without a path (the block itself rather than its NBT).
+     */
+    private static NbtRef nbtRef(String expr, Object source) throws Exception {
+        if (expr.startsWith("entity ")) {
+            DebugTargets.EntityRef ref = DebugTargets.parseEntity(expr.substring("entity ".length()), source);
+            return new NbtRef(DataInspector.entityTarget(ref.entity().getUUID()), ref.rest());
+        }
+        if (expr.startsWith("storage ")) {
+            String[] parts = expr.split("\\s+", 3);
+            return new NbtRef(DataInspector.storageTarget(Identifier.parse(parts[1])),
+                    parts.length > 2 ? parts[2] : "");
+        }
+        if (expr.startsWith("block ")) {
+            String[] parts = expr.split("\\s+", 5);
+            if (parts.length < 5) return null;
+            BlockPos pos = DebugTargets.resolveBlockPos(parts[1] + " " + parts[2] + " " + parts[3], source);
+            return new NbtRef(DataInspector.blockTarget(DebugTargets.sourceOrServer(source).getLevel(), pos),
+                    parts[4]);
+        }
+        return null;
+    }
+
+    /**
+     * Sets the value a watch expression names: a single score
+     * ({@code score <objective> <holder>}, integer) or the NBT at a
+     * storage/entity/block path (SNBT). Server thread only.
+     */
+    static String setExpression(String rawExpr, String value, StackSnapshot.Frame frame) throws Exception {
+        String expr = rawExpr.trim();
+        if (expr.startsWith("score ")) {
+            String[] parts = expr.split("\\s+");
+            if (parts.length == 3) {
+                return String.valueOf(DataInspector.setScore(parts[1], parts[2], Integer.parseInt(value.trim())));
+            }
+        } else {
+            NbtRef nbt = nbtRef(expr, frame != null ? frame.source() : null);
+            if (nbt != null && !nbt.path().isEmpty()) {
+                return preview(DataInspector.setData(nbt.target(), nbt.path(), value));
+            }
+        }
+        throw new IllegalArgumentException(
+                "Not editable: " + expr + " (only a single score or an NBT path can be set)");
+    }
+
+    /** Whether {@link #setExpression} accepts the expression. Server thread only. */
+    private static boolean isSettable(String rawExpr, StackSnapshot.Frame frame) {
+        String expr = rawExpr.trim();
+        if (expr.startsWith("score ")) return expr.split("\\s+").length == 3;
+        try {
+            NbtRef nbt = nbtRef(expr, frame != null ? frame.source() : null);
+            return nbt != null && !nbt.path().isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
@@ -374,6 +443,8 @@ final class VariableTree {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("name", current.get("name"));
         result.put("value", current.get("value"));
+        // The expression's own value; children report theirs below.
+        if (path.isEmpty()) result.put("editable", isSettable(expression, frame));
         Node node = scratch.get(refOf(current));
         result.put("hasChildren", node != null);
         if (node != null) {
@@ -385,6 +456,7 @@ final class VariableTree {
                 item.put("value", child.get("value"));
                 item.put("hasChildren", refOf(child) != 0);
                 item.put("editable", editable);
+                if (child.get("evaluateName") != null) item.put("evaluateName", child.get("evaluateName"));
                 children.add(item);
             }
             result.put("children", children);
@@ -568,9 +640,9 @@ final class VariableTree {
             List<Map<String, Object>> result = new ArrayList<>();
             for (Objective objective : scoreboard.getObjectives()) {
                 int count = scoreboard.listPlayerScores(objective).size();
-                result.add(tree.container(objective.getName(),
+                result.add(watchable(tree.container(objective.getName(),
                         objective.getCriteria().getName() + " (" + count + " scores)",
-                        new ObjectiveNode(objective.getName())));
+                        new ObjectiveNode(objective.getName())), "score " + objective.getName()));
             }
             return result;
         }
@@ -595,7 +667,12 @@ final class VariableTree {
             List<Map<String, Object>> result = new ArrayList<>();
             if (objective == null) return result;
             for (PlayerScoreEntry entry : scoreboard.listPlayerScores(objective)) {
-                result.add(leaf(entry.owner(), String.valueOf(entry.value())));
+                // "score <objective> <holder>" is whitespace-separated, so a
+                // holder containing whitespace has no watch expression.
+                String owner = entry.owner();
+                result.add(watchable(leaf(owner, String.valueOf(entry.value())),
+                        owner.chars().anyMatch(Character::isWhitespace) ? null
+                                : "score " + objectiveName + " " + owner));
                 if (result.size() >= MAX_CHILDREN) break;
             }
             return result;
@@ -621,7 +698,8 @@ final class VariableTree {
                 if (result.size() >= MAX_CHILDREN) return;
                 DataInspector.NbtTarget target = DataInspector.storageTarget(id);
                 CompoundTag tag = DebugSession.server().getCommandStorage().get(id);
-                result.add(tree.container(id.toString(), preview(tag), new NbtNode(target, "")));
+                result.add(watchable(tree.container(id.toString(), preview(tag), new NbtNode(target, "")),
+                        target.watchExpression("")));
             });
             return result;
         }
@@ -668,10 +746,13 @@ final class VariableTree {
         }
 
         private Map<String, Object> describe(VariableTree tree, String name, String fullPath, Tag tag) {
+            // Recorded (time-travel) values have no live counterpart to watch.
+            String expression = editable ? target.watchExpression(fullPath) : null;
             if (tag instanceof CompoundTag || tag instanceof CollectionTag) {
-                return tree.container(name, preview(tag), new NbtNode(target, fullPath, editable));
+                return watchable(tree.container(name, preview(tag), new NbtNode(target, fullPath, editable)),
+                        expression);
             }
-            return leaf(name, preview(tag));
+            return watchable(leaf(name, preview(tag)), expression);
         }
 
         @Override

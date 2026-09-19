@@ -27,7 +27,7 @@ jobs:
       - name: package vscode extension
         run: |
           cd vscode-extension
-          npx --yes @vscode/vsce package --allow-missing-repository
+          npx --yes @vscode/vsce package
       - name: create release
         uses: softprops/action-gh-release@v2
         with:

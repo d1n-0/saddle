@@ -11,6 +11,7 @@ Usage: python3 scripts/dap_smoke_test.py [--host H] [--port P] [--world DIR]
 """
 
 import argparse
+import gzip
 import json
 import os
 import queue
@@ -183,7 +184,7 @@ def main():
         client.wait_event("initialized", timeout=5)
         check(True, "initialized event received")
         version = client.wait_event("saddle/version", timeout=5)["body"]["version"]
-        check(version == "1.1.0", "mod reports its version for compatibility checks", version)
+        check(version == "1.2.0", "mod reports its version for compatibility checks", version)
         client.request("attach", {})
 
         print("== load test datapack ==")
@@ -556,6 +557,15 @@ def main():
         value = client.request("minecraft/getData",
                                {"type": "entity", "target": uuid, "path": "data.k"})["body"]["value"]
         check(value == "42", "entity NBT write", value)
+        # Watch expressions name entities like /data get entity: UUID or selector.
+        node = client.request("saddle/live", {"expression": f"entity {uuid} data.k", "path": []})["body"]
+        check(node["value"] == "42", "entity watch expression by UUID", str(node))
+        node = client.request("saddle/live", {"expression": "entity @e[type=marker, limit=1] data.k",
+                                              "path": []})["body"]
+        check(node["value"] == "42", "entity watch expression by selector", str(node))
+        live = client.request("saddle/live", {"expression": "@e[type=marker,limit=1]", "path": []})["body"]
+        check(live["children"] and live["children"][0].get("evaluateName") == f"entity {uuid}",
+              "non-player entities are watched by UUID", str(live))
 
         evaluate(client, "setblock 9 10 8 minecraft:barrel")
         block = client.request("minecraft/getBlock", {"pos": "9 10 8"})["body"]
@@ -721,6 +731,37 @@ def main():
                                           "path": [], "name": "target", "value": "77"})
         result = evaluate(client, "scoreboard players get target saddle_dbg")
         check("77" in result, "live watch score edit applies", result)
+        # Nested rows carry a standalone expression (DAP evaluateName) so they
+        # can be watched on their own from the Saddle Watch context menu.
+        live = client.request("saddle/live", {"expression": "storage saddle_test:store", "path": ["foo"]})["body"]
+        bar = next(c for c in live["children"] if c["name"] == "bar")
+        check(bar.get("evaluateName") == "storage saddle_test:store foo.bar",
+              "NBT child carries a watch expression", str(bar))
+        node = client.request("saddle/live", {"expression": bar["evaluateName"], "path": []})["body"]
+        check(node["value"] == "63", "child watch expression resolves to the same value", str(node))
+        live = client.request("saddle/live", {"expression": "scoreboard", "path": []})["body"]
+        objective = next(c for c in live["children"] if c["name"] == "saddle_dbg")
+        check(objective.get("evaluateName") == "score saddle_dbg", "objective carries a watch expression",
+              str(objective))
+        live = client.request("saddle/live", {"expression": "score saddle_dbg", "path": []})["body"]
+        target = next(c for c in live["children"] if c["name"] == "target")
+        node = client.request("saddle/live", {"expression": target["evaluateName"], "path": []})["body"]
+        check(node["value"] == "77", "score holder watch expression resolves", str(target) + str(node))
+        # Pins added from nested rows edit their own value (liveSet without a name).
+        root = client.request("saddle/live", {"expression": bar["evaluateName"], "path": []})["body"]
+        check(root.get("editable") is True, "NBT path pin is editable", str(root))
+        root = client.request("saddle/live", {"expression": "storage saddle_test:store", "path": []})["body"]
+        check(root.get("editable") is False, "whole storage pin is not directly editable", str(root))
+        client.request("saddle/liveSet", {"expression": bar["evaluateName"], "path": [], "value": "64"})
+        result = evaluate(client, "data get storage saddle_test:store foo.bar")
+        check("64" in result, "NBT path pin edit applies", result)
+        client.request("saddle/liveSet", {"expression": target["evaluateName"], "path": [], "value": "78"})
+        result = evaluate(client, "scoreboard players get target saddle_dbg")
+        check("78" in result, "score pin edit applies", result)
+        resp = client.request("saddle/liveSet", {"expression": "score saddle_dbg", "path": [], "value": "1"},
+                              expect_success=False)
+        check(not resp.get("success") and "Not editable" in resp.get("message", ""),
+              "pins without a settable value refuse edits", str(resp))
 
         print("== async evaluate responsiveness ==")
         client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": [{"line": 4}]})
@@ -745,6 +786,87 @@ def main():
         evaluate_thread.join(timeout=10)
         check("resp" in result_holder, "pending evaluate eventually responds", str(result_holder))
         client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": []})
+
+        print("== reload & run function from file ==")
+        hot_fn = os.path.join(pack_dir, "data", "saddle_test", "function", "hot.mcfunction")
+        with open(hot_fn, "w", encoding="utf-8") as f:
+            f.write("# added after the first load\nscoreboard players set hot saddle_dbg 5\n")
+        resp = client.request("saddle/runFunction", {"path": hot_fn}, expect_success=False)
+        check(not resp.get("success") and "not loaded" in resp.get("message", ""),
+              "run function refuses a function that is not loaded yet", str(resp))
+        client.request("saddle/reload", {}, timeout=60)
+        check(True, "saddle/reload completes")
+        # Earlier chat lines may still be queued; look for the announcement.
+        deadline = time.monotonic() + 5
+        announced = False
+        while not announced and time.monotonic() < deadline:
+            output = client.wait_event("output", timeout=max(0.1, deadline - time.monotonic()))
+            announced = "datapacks reloaded" in output["body"]["output"]
+        check(announced, "reload is announced in the console")
+        resp = client.request("saddle/runFunction", {"path": hot_fn})
+        result = evaluate(client, "scoreboard players get hot saddle_dbg")
+        check("5" in result, "run function executes the reloaded file", result + " / " + str(resp["body"]))
+        resp = client.request("saddle/runFunction", {"path": macro_fn, "arguments": "{x: 9}"})
+        result = evaluate(client, "scoreboard players get macro_result saddle_dbg")
+        check("9" in result, "run function passes macro arguments", result)
+        resp = client.request("saddle/runFunction", {"path": main_fn, "executor": "@e[type=marker,limit=1]"})
+        check("result" in resp["body"], "run function as an executor", str(resp["body"]))
+        resp = client.request("saddle/runFunction", {"path": "/tmp/not-a-pack/hot.mcfunction"},
+                              expect_success=False)
+        check(not resp.get("success") and "Not a datapack function" in resp.get("message", ""),
+              "run function rejects paths outside a datapack", str(resp))
+        resp = client.request("saddle/runFunction", {"path": hot_fn, "arguments": "{}\nsay injected"},
+                              expect_success=False)
+        check(not resp.get("success"), "run function rejects multi-line arguments", str(resp))
+
+        client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": [{"line": 4}]})
+        client.request("saddle/runFunction", {"path": main_fn}, timeout=15)
+        stopped = client.wait_event("stopped")
+        check(stopped["body"]["reason"] == "breakpoint", "run function stops at breakpoints")
+        resp = client.request("saddle/reload", {}, expect_success=False, timeout=15)
+        check(not resp.get("success") and "breakpoint" in resp.get("message", ""),
+              "reload is refused while stopped at a breakpoint", str(resp))
+        client.request("setBreakpoints", {"source": {"path": main_fn}, "breakpoints": []})
+        client.request("continue", {"threadId": 1})
+        os.remove(hot_fn)
+        client.request("saddle/reload", {}, timeout=60)
+
+        print("== deploy ==")
+        world_dir = os.path.abspath(args.world)
+        container = os.path.dirname(world_dir)
+        fake_player = os.path.join(world_dir, "players", "data", "00000000-0000-0000-0000-00000000beef.dat")
+        os.makedirs(os.path.dirname(fake_player), exist_ok=True)
+        with open(fake_player, "wb") as f:
+            f.write(b"not a real player file")
+        result = evaluate(client, "deploy")
+        check("/deploy copy" in result and "/deploy apply" in result,
+              "deploy without a player prints usage", result)
+        deploy_dir = os.path.join(container, "saddle-deploy-test")
+        shutil.rmtree(deploy_dir, ignore_errors=True)
+        result = evaluate(client, "deploy copy saddle-deploy-test", timeout=60)
+        check("World deployed" in result, "deploy copy succeeds", result)
+        check(os.path.isfile(os.path.join(deploy_dir, "level.dat")), "deployed copy keeps level.dat")
+        check(os.path.isfile(os.path.join(deploy_dir, "datapacks", "saddle-test", "pack.mcmeta")),
+              "deployed copy keeps datapacks")
+        check(os.path.isdir(os.path.join(deploy_dir, "data")), "deployed copy keeps saved data")
+        check(not os.path.exists(os.path.join(deploy_dir, "players")), "deployed copy drops player data")
+        # level.dat is gzipped NBT; key names appear verbatim in the payload.
+        with gzip.open(os.path.join(world_dir, "level.dat")) as f:
+            source_level = f.read()
+        with gzip.open(os.path.join(deploy_dir, "level.dat")) as f:
+            deployed_level = f.read()
+        check(b"LastPlayed" in source_level and b"LastPlayed" not in deployed_level
+              and b"LevelName" in deployed_level,
+              "deployed level.dat drops LastPlayed and keeps the world settings")
+        check(not os.path.exists(os.path.join(deploy_dir, "session.lock")), "deployed copy drops the session lock")
+        check(os.path.isfile(fake_player), "deploy copy leaves the running world untouched")
+        result = evaluate(client, "deploy copy saddle-deploy-test", timeout=30)
+        check("not an empty folder" in result, "deploy copy refuses a non-empty destination", result)
+        result = evaluate(client, "deploy copy " + os.path.join(world_dir, "nested"), timeout=30)
+        check("outside the world folder" in result, "deploy copy refuses a destination inside the world", result)
+        check(not os.path.exists(os.path.join(world_dir, "nested")), "refused deploy writes nothing")
+        shutil.rmtree(deploy_dir, ignore_errors=True)
+        os.remove(fake_player)
 
         print("== disconnect ==")
         client.request("disconnect", {})

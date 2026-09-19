@@ -14,6 +14,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.commands.data.BlockDataAccessor;
 import net.minecraft.server.commands.data.EntityDataAccessor;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -41,6 +42,15 @@ public final class DataInspector {
         void write(CompoundTag tag) throws Exception;
 
         String describe();
+
+        /**
+         * A standalone watch expression for the value at {@code path}, or
+         * null when the target cannot be addressed by one (block targets:
+         * a watch expression cannot name the dimension).
+         */
+        default String watchExpression(String path) {
+            return null;
+        }
 
         /** Called with the live root just before an in-place mutation. */
         default void noteBeforeMutation(CompoundTag root) {}
@@ -84,6 +94,11 @@ public final class DataInspector {
             }
 
             @Override
+            public String watchExpression(String path) {
+                return withPath(describe(), path);
+            }
+
+            @Override
             public void noteBeforeMutation(CompoundTag root) {
                 // CommandStorage.get returns the live tag; preserve the true
                 // before-value for the time-travel recording.
@@ -114,7 +129,19 @@ public final class DataInspector {
             public String describe() {
                 return "entity " + uuid;
             }
+
+            @Override
+            public String watchExpression(String path) {
+                // Players by name: short, and still valid after a rejoin.
+                ServerPlayer player = DebugSession.server().getPlayerList().getPlayer(uuid);
+                return withPath(player != null ? "entity " + player.getScoreboardName() : describe(), path);
+            }
         };
+    }
+
+    /** "storage &lt;id&gt; [path]" / "entity &lt;target&gt; [path]" watch expression form. */
+    private static String withPath(String target, String path) {
+        return path.isEmpty() ? target : target + " " + path;
     }
 
     public static NbtTarget blockTarget(ServerLevel level, BlockPos pos) {
@@ -173,7 +200,7 @@ public final class DataInspector {
         CompoundTag root = target.read();
         if (path == null || path.isEmpty()) return root;
         List<Tag> tags = NbtPathArgument.NbtPath.of(path).get(root);
-        return tags.size() == 1 ? tags.getFirst() : listToString(tags);
+        return tags.size() == 1 ? tags.getFirst() : asList(tags);
     }
 
     public static Tag setData(NbtTarget target, String path, String snbtValue) throws Exception {
@@ -210,7 +237,8 @@ public final class DataInspector {
         return level;
     }
 
-    private static Tag listToString(List<Tag> tags) {
+    /** Several path matches are shown as one list, like /data get would. */
+    private static Tag asList(List<Tag> tags) {
         net.minecraft.nbt.ListTag list = new net.minecraft.nbt.ListTag();
         list.addAll(tags);
         return list;

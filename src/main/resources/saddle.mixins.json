@@ -9,6 +9,7 @@
 		"MacroEntryMixin",
 		"MacroFunctionMixin",
 		"PlayerListMixin",
+		"ServerCommonPacketListenerMixin",
 		"ServerPlayerMixin",
 		"ServerScoreboardMixin",
 		"StorageDataAccessorMixin"

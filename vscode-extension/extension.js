@@ -2,9 +2,12 @@
 // embedded in the Saddle Fabric mod (TCP, default 127.0.0.1:16352).
 const vscode = require('vscode');
 const crypto = require('crypto');
+const fs = require('fs');
+const nodePath = require('path');
 
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 16352;
+const WATCH_LABELS_KEY = 'saddle.watchLabels';
 
 class SaddleConfigurationProvider {
 	// Allows F5 in a .mcfunction file without a launch.json.
@@ -27,12 +30,103 @@ class SaddleAdapterDescriptorFactory {
 	}
 }
 
-function activeSession() {
+// The active debug session if it is a Saddle one, else undefined.
+function saddleSession() {
 	const session = vscode.debug.activeDebugSession;
-	if (!session || session.type !== 'saddle') {
+	return session && session.type === 'saddle' ? session : undefined;
+}
+
+function activeSession() {
+	const session = saddleSession();
+	if (!session) {
 		throw new Error('No active Saddle debug session. Start "Attach to Minecraft (Saddle)" first.');
 	}
 	return session;
+}
+
+// The active Saddle session, attaching first when there is none: prefers a
+// "saddle" configuration from the folder's launch.json, else the defaults.
+async function ensureSession(folder) {
+	const current = saddleSession();
+	if (current) return current;
+	const configs = vscode.workspace.getConfiguration('launch', folder).get('configurations', []);
+	const config = configs.find((c) => c && c.type === 'saddle' && c.request === 'attach')
+		|| { type: 'saddle', request: 'attach', name: 'Attach to Minecraft (Saddle)' };
+	if (!await vscode.debug.startDebugging(folder, config)) {
+		throw new Error('Could not attach to Minecraft (Saddle). Is the game running with the Saddle mod?');
+	}
+	return activeSession();
+}
+
+// Files whose changes a datapack reload picks up: a datapack's pack.mcmeta
+// and anything under its data/ folder (functions, JSON registries,
+// structures). A datapack root is a folder holding both pack.mcmeta and
+// data/, so unrelated folders that happen to be named "data" never trigger
+// a reload.
+function isDatapackFile(uri) {
+	if (uri.scheme !== 'file') return false;
+	const file = uri.fsPath;
+	if (nodePath.basename(file) === 'pack.mcmeta') {
+		return fs.existsSync(nodePath.join(nodePath.dirname(file), 'data'));
+	}
+	for (let dir = nodePath.dirname(file); ;) {
+		const parent = nodePath.dirname(dir);
+		if (parent === dir) return false;
+		if (nodePath.basename(dir) === 'data' && fs.existsSync(nodePath.join(parent, 'pack.mcmeta'))) {
+			return true;
+		}
+		dir = parent;
+	}
+}
+
+// Reload-on-save (nodemon style): saves are debounced so "Save All" triggers
+// one reload, reloads never overlap, and "Run Function" can wait until the
+// reload triggered by its own save has finished.
+class ReloadScheduler {
+	constructor() {
+		this.timer = undefined;
+		this.waiters = [];
+		this.running = Promise.resolve();
+	}
+
+	schedule() {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			const waiters = this.waiters.splice(0);
+			this.run().finally(() => waiters.forEach((resolve) => resolve()));
+		}, 300);
+	}
+
+	run() {
+		this.running = this.running.then(() => this.reload());
+		return this.running;
+	}
+
+	// Resolves once no reload is scheduled or running.
+	async idle() {
+		if (this.timer) await new Promise((resolve) => this.waiters.push(resolve));
+		await this.running;
+	}
+
+	async reload() {
+		const session = saddleSession();
+		if (!session) return;
+		const status = vscode.window.setStatusBarMessage('$(sync~spin) Saddle: reloading datapacks…');
+		try {
+			await session.customRequest('saddle/reload', {});
+			status.dispose();
+			vscode.window.setStatusBarMessage('$(check) Saddle: datapacks reloaded', 3000);
+		} catch (err) {
+			status.dispose();
+			vscode.window.showWarningMessage(`Saddle: ${(err && err.message) || err}`);
+		}
+	}
+
+	dispose() {
+		if (this.timer) clearTimeout(this.timer);
+		this.waiters.splice(0).forEach((resolve) => resolve());
+	}
 }
 
 // Debug hover targets in .mcfunction files: macro arguments `$(name)`,
@@ -100,15 +194,41 @@ class SaddleEvaluatableExpressionProvider {
 // stateless "saddle/live" request, so values refresh in real time while the
 // game runs; score/NBT rows are edited in place via "saddle/liveSet".
 class SaddleWatchViewProvider {
-	constructor() {
+	// state: a Memento (workspaceState) holding display labels of pins.
+	constructor(state) {
+		this.state = state;
 		this.view = undefined;
 		this.expanded = new Set();
 		this.refreshing = false;
 	}
 
+	// Display labels by pin expression. Labels only change what the view
+	// shows; the pinned expression itself stays as it is.
+	labels() {
+		return this.state.get(WATCH_LABELS_KEY, {});
+	}
+
+	async setLabel(expr, label) {
+		const labels = { ...this.labels() };
+		if (label) labels[expr] = label;
+		else delete labels[expr];
+		await this.state.update(WATCH_LABELS_KEY, labels);
+	}
+
+	async rename(expr) {
+		const current = this.labels()[expr];
+		const label = await vscode.window.showInputBox({
+			prompt: `Display name for ${expr} (empty restores the expression)`,
+			value: current ?? expr,
+		});
+		if (label === undefined) return;
+		const trimmed = label.trim();
+		await this.setLabel(expr, trimmed === expr ? '' : trimmed);
+		await this.refresh();
+	}
+
 	session() {
-		const session = vscode.debug.activeDebugSession;
-		return session && session.type === 'saddle' ? session : undefined;
+		return saddleSession();
 	}
 
 	resolveWebviewView(webviewView) {
@@ -135,17 +255,21 @@ class SaddleWatchViewProvider {
 				await this.refresh();
 			} else if (msg.type === 'edit') {
 				const value = await vscode.window.showInputBox({
-					prompt: `New value for ${msg.name} (SNBT / integer)`,
+					prompt: `New value for ${msg.label} (SNBT / integer)`,
 					value: String(msg.value ?? ''),
 				});
 				if (value === undefined) return;
+				// A pin row sets its own expression (no child name).
 				await this.session().customRequest('saddle/liveSet', {
 					expression: msg.expr, path: msg.path, name: msg.name, value,
 				});
 				await this.refresh();
 			} else if (msg.type === 'remove') {
 				await this.session().customRequest('saddle/unpin', { expression: msg.expr });
+				await this.setLabel(msg.expr, '');
 				await this.refresh();
+			} else if (msg.type === 'rename') {
+				await this.rename(msg.expr);
 			} else if (msg.type === 'add') {
 				await vscode.commands.executeCommand('saddle.pin');
 			}
@@ -160,23 +284,25 @@ class SaddleWatchViewProvider {
 		if (!session) return { rows: [], attached: false };
 		const { pins } = await session.customRequest('saddle/pins', {});
 		const rows = [];
-		const walk = async (expr, path, name, value, hasChildren, editable, depth) => {
+		const walk = async (expr, path, name, value, hasChildren, editable, depth, evaluateName) => {
 			const key = this.key(expr, path);
 			const isOpen = hasChildren && this.expanded.has(key);
-			rows.push({ expr, path, name, value, hasChildren, editable, depth, open: isOpen });
+			rows.push({ expr, path, name, value, hasChildren, editable, depth, open: isOpen, evaluateName });
 			if (!isOpen) return;
 			const body = await session.customRequest('saddle/live', { expression: expr, path });
 			for (const child of body.children || []) {
 				await walk(expr, [...path, child.name], child.name, child.value,
-					child.hasChildren, child.editable, depth + 1);
+					child.hasChildren, child.editable, depth + 1, child.evaluateName);
 			}
 		};
+		const labels = this.labels();
 		for (const expr of pins) {
+			const name = labels[expr] || expr;
 			try {
 				const body = await session.customRequest('saddle/live', { expression: expr, path: [] });
-				await walk(expr, [], expr, body.value, body.hasChildren, false, 0);
+				await walk(expr, [], name, body.value, body.hasChildren, Boolean(body.editable), 0);
 			} catch (err) {
-				rows.push({ expr, path: [], name: expr, depth: 0,
+				rows.push({ expr, path: [], name, depth: 0,
 					value: `(${(err && err.message) || 'unresolvable'})`, error: true });
 			}
 		}
@@ -223,6 +349,7 @@ class SaddleWatchViewProvider {
 		overflow: hidden;
 	}
 	.row:hover { background: var(--vscode-list-hoverBackground); }
+	.row:focus { outline: 1px solid var(--vscode-list-focusOutline); outline-offset: -1px; }
 	.twistie {
 		flex-shrink: 0;
 		width: 16px;
@@ -262,7 +389,7 @@ class SaddleWatchViewProvider {
 <body>
 <div id="empty" style="display:none">
 	No expressions yet. <a id="addLink">Add an expression</a> — it updates live while the game runs.<br><br>
-	Supported: @selector · storage &lt;id&gt; [path] · entity &lt;uuid&gt; [path] · block &lt;x&gt; &lt;y&gt; &lt;z&gt; [path] · score &lt;objective&gt; [holder] · scoreboard · storage<br><br>
+	Supported: @selector · storage &lt;id&gt; [path] · entity &lt;player|uuid|@selector&gt; [path] · block &lt;x&gt; &lt;y&gt; &lt;z&gt; [path] · score &lt;objective&gt; [holder] · scoreboard · storage<br><br>
 	Tip: right-click the Run and Debug section headers and uncheck "Watch" to keep this as your only watch panel.
 </div>
 <div id="tree"></div>
@@ -291,11 +418,17 @@ class SaddleWatchViewProvider {
 			return;
 		}
 		empty.style.display = 'none';
+		// Rows are rebuilt on every refresh; keep keyboard focus on the same row.
+		const focusedKey = document.activeElement && document.activeElement.dataset
+			? document.activeElement.dataset.key : undefined;
 		tree.innerHTML = '';
 		for (const row of rows) {
 			const el = document.createElement('div');
 			el.className = 'row' + (row.open ? ' open' : '');
 			el.style.paddingLeft = (row.depth * 16 + 2) + 'px';
+			el.tabIndex = 0;
+			el.dataset.key = JSON.stringify([row.expr, ...row.path]);
+			if (row.path.length === 0) el.dataset.pin = row.expr;
 
 			const twistie = document.createElement('span');
 			twistie.className = 'twistie';
@@ -316,7 +449,20 @@ class SaddleWatchViewProvider {
 				expression.appendChild(value);
 			}
 			el.appendChild(expression);
-			el.title = String(row.value ?? '');
+			// Pins may show a display name; the tooltip keeps the expression.
+			el.title = row.path.length === 0 && row.name !== row.expr
+				? row.expr + (row.value !== undefined ? ' = ' + row.value : '')
+				: String(row.value ?? '');
+			// Right-click menu (package.json "webview/context"): pins can be
+			// renamed; nested rows with a standalone expression can be added
+			// as their own watch.
+			el.dataset.vscodeContext = JSON.stringify(row.path.length === 0
+				? { webviewSection: 'saddleWatchPin', saddleExpression: row.expr,
+					preventDefaultContextMenuItems: true }
+				: row.evaluateName
+					? { webviewSection: 'saddleWatchNode', saddleExpression: row.evaluateName,
+						preventDefaultContextMenuItems: true }
+					: { preventDefaultContextMenuItems: true });
 
 			const actions = document.createElement('span');
 			actions.className = 'actions';
@@ -327,8 +473,9 @@ class SaddleWatchViewProvider {
 				edit.innerHTML = EDIT;
 				edit.addEventListener('click', (e) => {
 					e.stopPropagation();
-					vscodeApi.postMessage({ type: 'edit', expr: row.expr,
-						path: row.path.slice(0, -1), name: row.name, value: row.value });
+					const isPin = row.path.length === 0;
+					vscodeApi.postMessage({ type: 'edit', expr: row.expr, label: row.name,
+						path: row.path.slice(0, -1), name: isPin ? undefined : row.name, value: row.value });
 				});
 				actions.appendChild(edit);
 			}
@@ -350,6 +497,16 @@ class SaddleWatchViewProvider {
 					vscodeApi.postMessage({ type: 'toggle', expr: row.expr, path: row.path }));
 			}
 			tree.appendChild(el);
+			if (el.dataset.key === focusedKey) el.focus();
+		}
+	});
+	// F2 renames the focused pin, like renaming in a native tree.
+	document.addEventListener('keydown', (e) => {
+		const pin = document.activeElement && document.activeElement.dataset
+			? document.activeElement.dataset.pin : undefined;
+		if (e.key === 'F2' && pin !== undefined) {
+			e.preventDefault();
+			vscodeApi.postMessage({ type: 'rename', expr: pin });
 		}
 	});
 	document.getElementById('addLink').addEventListener('click', () =>
@@ -362,7 +519,7 @@ class SaddleWatchViewProvider {
 
 function activate(context) {
 	const output = vscode.window.createOutputChannel('Saddle');
-	const liveWatch = new SaddleWatchViewProvider();
+	const liveWatch = new SaddleWatchViewProvider(context.workspaceState);
 
 	let liveTimer;
 	const restartLiveTimer = () => {
@@ -384,16 +541,17 @@ function activate(context) {
 		{ dispose: () => clearInterval(liveTimer) },
 	);
 
-	const show = (title, body) => {
+	// reveal: false only logs, leaving the currently visible panel tab as is.
+	const show = (title, body, reveal = true) => {
 		output.appendLine(`— ${title} ${'—'.repeat(Math.max(0, 60 - title.length))}`);
 		output.appendLine(typeof body === 'string' ? body : JSON.stringify(body, null, 2));
-		output.show(true);
+		if (reveal) output.show(true);
 	};
 
 	const command = (id, handler) =>
-		context.subscriptions.push(vscode.commands.registerCommand(id, async () => {
+		context.subscriptions.push(vscode.commands.registerCommand(id, async (...args) => {
 			try {
-				await handler();
+				await handler(...args);
 			} catch (err) {
 				vscode.window.showErrorMessage(String(err.message || err));
 			}
@@ -471,7 +629,7 @@ function activate(context) {
 		const selected = editor && !editor.selection.isEmpty
 			? editor.document.getText(editor.selection) : '';
 		const expression = await prompt(
-			'Expression to watch: @selector | storage <id> [path] | entity <uuid> [path] | block <x> <y> <z> [path] | score <objective> [holder] | scoreboard',
+			'Expression to watch: @selector | storage <id> [path] | entity <player|uuid|@selector> [path] | block <x> <y> <z> [path] | score <objective> [holder] | scoreboard',
 			{ value: selected });
 		const body = await activeSession().customRequest('saddle/pin', { expression });
 		liveWatch.refresh();
@@ -484,10 +642,28 @@ function activate(context) {
 		const expression = await vscode.window.showQuickPick(pins, { placeHolder: 'Unpin expression' });
 		if (!expression) return;
 		await activeSession().customRequest('saddle/unpin', { expression });
+		await liveWatch.setLabel(expression, '');
 		liveWatch.refresh();
 	});
 
 	command('saddle.liveRefresh', async () => liveWatch.refresh());
+
+	// Saddle Watch context menu: rename a pin (display name only).
+	command('saddle.renameWatch', async (row) => {
+		if (!row || typeof row.saddleExpression !== 'string') return;
+		await liveWatch.rename(row.saddleExpression);
+	});
+
+	// Saddle Watch context menu: watch a nested node as its own entry. The
+	// argument is the row's data-vscode-context object.
+	command('saddle.watchNode', async (row) => {
+		const expression = row && typeof row.saddleExpression === 'string'
+			? row.saddleExpression.trim() : '';
+		if (!expression) throw new Error('This row cannot be watched on its own.');
+		const body = await activeSession().customRequest('saddle/pin', { expression });
+		liveWatch.refresh();
+		vscode.window.setStatusBarMessage(`Saddle: watching ${body.pins.length} expression(s)`, 3000);
+	});
 
 	// Warn when the mod and this extension drift apart (major.minor compare).
 	context.subscriptions.push(vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
@@ -510,6 +686,102 @@ function activate(context) {
 			`-${String(s.behind).padStart(5)}  ${'· '.repeat(Math.max(0, s.depth - 1))}${s.function}:${s.line}` +
 			`  ${s.command}${s.executor && s.executor !== 'server' ? `  [as ${s.executor}]` : ''}`);
 		show(`execution trace (${body.steps.length} steps, oldest first)`, lines.join('\n'));
+	});
+
+	// Reload on save.
+	const reloads = new ReloadScheduler();
+	const reloadOnSave = () => vscode.workspace.getConfiguration('saddle').get('reloadOnSave', false);
+	const reloadStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+	reloadStatus.command = 'saddle.toggleReloadOnSave';
+	const updateReloadStatus = () => {
+		if (!saddleSession()) {
+			reloadStatus.hide();
+			return;
+		}
+		const enabled = reloadOnSave();
+		reloadStatus.text = enabled ? '$(sync) Reload on Save' : '$(sync-ignored) Reload on Save';
+		reloadStatus.tooltip = enabled
+			? 'Saddle reloads datapacks whenever a datapack file is saved. Click to turn off.'
+			: 'Saddle reload on save is off. Click to turn on.';
+		reloadStatus.show();
+	};
+	updateReloadStatus();
+	context.subscriptions.push(
+		reloads,
+		reloadStatus,
+		vscode.workspace.onDidSaveTextDocument((document) => {
+			if (reloadOnSave() && saddleSession() && isDatapackFile(document.uri)) reloads.schedule();
+		}),
+		vscode.debug.onDidChangeActiveDebugSession(updateReloadStatus),
+		vscode.workspace.onDidChangeConfiguration((event) => {
+			if (event.affectsConfiguration('saddle.reloadOnSave')) updateReloadStatus();
+		}),
+	);
+
+	command('saddle.reload', async () => {
+		activeSession();
+		await reloads.run();
+	});
+
+	command('saddle.toggleReloadOnSave', async () => {
+		const config = vscode.workspace.getConfiguration('saddle');
+		const inspected = config.inspect('reloadOnSave');
+		// Write where the effective value comes from, so the toggle is not
+		// shadowed by a more specific setting.
+		const target = inspected && inspected.workspaceFolderValue !== undefined
+			? vscode.ConfigurationTarget.WorkspaceFolder
+			: inspected && inspected.workspaceValue !== undefined
+				? vscode.ConfigurationTarget.Workspace
+				: vscode.ConfigurationTarget.Global;
+		const enabled = !config.get('reloadOnSave', false);
+		await config.update('reloadOnSave', enabled, target);
+		vscode.window.setStatusBarMessage(`Saddle: reload on save ${enabled ? 'on' : 'off'}`, 3000);
+	});
+
+	// Run the function in the current .mcfunction file. Macro functions ask
+	// for their arguments (remembered per file for the session).
+	const lastMacroArgs = new Map();
+	command('saddle.runFunction', async (uri) => {
+		const target = uri instanceof vscode.Uri ? uri : vscode.window.activeTextEditor?.document.uri;
+		if (!target || target.scheme !== 'file' || !target.fsPath.endsWith('.mcfunction')) {
+			throw new Error('Open a .mcfunction file to run it.');
+		}
+		const document = await vscode.workspace.openTextDocument(target);
+		const saved = document.isDirty && await document.save();
+		const session = await ensureSession(vscode.workspace.getWorkspaceFolder(target));
+		if (saved && isDatapackFile(target)) {
+			if (reloadOnSave()) {
+				// Run the code just saved: make sure its reload is scheduled
+				// (the save listener may not have fired yet; the debounce
+				// merges both) and wait for it below.
+				reloads.schedule();
+			} else {
+				vscode.window.showInformationMessage(
+					'Saddle: saved, but reload on save is off — the game still runs the previously loaded version. '
+					+ 'Run "Saddle: Reload Datapacks" to apply the change.');
+			}
+		}
+		await reloads.idle();
+
+		const key = target.toString();
+		let args;
+		if (/^\s*\$/m.test(document.getText())) {
+			args = await prompt('Macro arguments (SNBT compound)', {
+				value: lastMacroArgs.get(key) ?? '{}',
+				placeHolder: '{name: "value", count: 3}',
+			});
+			lastMacroArgs.set(key, args);
+		}
+		const executor = vscode.workspace.getConfiguration('saddle').get('runFunctionExecutor', '');
+		const body = await session.customRequest('saddle/runFunction', {
+			path: target.fsPath, arguments: args, executor,
+		});
+		// Keep the user's current panel tab; the result is logged to the Saddle
+		// output and summarized in the status bar.
+		const name = vscode.workspace.asRelativePath(target);
+		show(`run ${name}`, body.result, false);
+		const summary = String(body.result ?? '').split('\n')[0];
+		vscode.window.setStatusBarMessage(`$(play) Saddle: ran ${name}${summary ? ` — ${summary}` : ''}`, 5000);
 	});
 
 	command('saddle.getBlock', async () => {

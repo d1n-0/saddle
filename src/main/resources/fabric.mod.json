@@ -3,11 +3,15 @@
 	"id": "saddle",
 	"version": "${version}",
 	"name": "Saddle",
-	"description": "Debug Adapter Protocol (DAP) server for debugging Minecraft datapack functions from editors like VS Code: breakpoints, stepping, call stacks and command evaluation.",
+	"description": "Debug Adapter Protocol (DAP) server for debugging Minecraft datapack functions from editors like VS Code: breakpoints, stepping, call stacks, command evaluation, run-from-file and reload on save, plus /deploy to ship a map without player data.",
 	"authors": [
 		"d1n0"
 	],
-	"contact": {},
+	"contact": {
+		"homepage": "https://modrinth.com/mod/saddle-datapack-debugger",
+		"sources": "https://github.com/d1n-0/saddle",
+		"issues": "https://github.com/d1n-0/saddle/issues"
+	},
 	"license": "MIT",
 	"icon": "assets/saddle/icon.png",
 	"environment": "*",
@@ -24,7 +28,7 @@
 	],
 	"depends": {
 		"fabricloader": ">=0.19.0",
-		"minecraft": "~26.2",
+		"minecraft": ["~26.2", "~26.3"],
 		"java": ">=25",
 		"fabric-api": "*"
 	},

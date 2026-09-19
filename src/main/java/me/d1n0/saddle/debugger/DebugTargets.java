@@ -4,6 +4,7 @@ import com.mojang.brigadier.StringReader;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
 
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
 import net.minecraft.commands.arguments.selector.EntitySelectorParser;
 import net.minecraft.core.BlockPos;
@@ -31,6 +32,20 @@ public final class DebugTargets {
         return source instanceof CommandSourceStack css
                 ? css
                 : DebugSession.server().createCommandSourceStack();
+    }
+
+    /** A single entity plus the text after its reference (an NBT path in watch expressions). */
+    public record EntityRef(Entity entity, String rest) {}
+
+    /**
+     * Parses a leading entity reference the way /data get entity does — a
+     * player name, a UUID or a single-entity selector — and resolves it.
+     */
+    public static EntityRef parseEntity(String text, Object source) throws CommandSyntaxException {
+        StringReader reader = new StringReader(text.strip());
+        Entity entity = EntityArgument.entity().parse(reader)
+                .findSingleEntity(sourceOrServer(source).withSuppressedOutput());
+        return new EntityRef(entity, reader.getRemaining().strip());
     }
 
     public static List<? extends Entity> selectEntities(String selector, Object source)

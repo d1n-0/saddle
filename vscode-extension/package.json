@@ -1,10 +1,19 @@
 {
 	"name": "saddle-debug",
 	"displayName": "Saddle — Minecraft Datapack Debugger",
-	"description": "Debug Minecraft datapack .mcfunction files through the Saddle mod: breakpoints (incl. macro lines), stepping, call stacks, live scoreboard/storage/entity NBT editing and a command console.",
-	"version": "1.1.0",
+	"description": "Debug Minecraft datapack .mcfunction files through the Saddle mod: breakpoints (incl. macro lines), stepping, call stacks, live scoreboard/storage/entity NBT editing, a command console, run-from-file and reload on save.",
+	"version": "1.2.0",
 	"publisher": "d1n0",
 	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/d1n-0/saddle.git",
+		"directory": "vscode-extension"
+	},
+	"homepage": "https://github.com/d1n-0/saddle#readme",
+	"bugs": {
+		"url": "https://github.com/d1n-0/saddle/issues"
+	},
 	"icon": "icon.png",
 	"engines": {
 		"vscode": "^1.85.0"
@@ -37,10 +46,73 @@
 					"default": 1000,
 					"minimum": 200,
 					"description": "Refresh interval (ms) for the Saddle Live Watch view."
+				},
+				"saddle.reloadOnSave": {
+					"type": "boolean",
+					"default": false,
+					"description": "Reload datapacks (like /reload) whenever a datapack file (pack.mcmeta, or anything under the data/ folder next to it) is saved while attached."
+				},
+				"saddle.runFunctionExecutor": {
+					"type": "string",
+					"default": "",
+					"markdownDescription": "Entity that runs functions started with **Saddle: Run Function From File**, e.g. `@p` or a player name — the command becomes `execute as <executor> at @s run function ...`. Empty runs them as the server, like the Debug Console."
 				}
 			}
 		},
+		"keybindings": [
+			{
+				"command": "saddle.runFunction",
+				"key": "ctrl+alt+enter",
+				"mac": "cmd+alt+enter",
+				"when": "editorTextFocus && editorLangId == mcfunction"
+			}
+		],
 		"menus": {
+			"editor/title/run": [
+				{
+					"command": "saddle.runFunction",
+					"when": "resourceExtname == .mcfunction",
+					"group": "navigation@1"
+				}
+			],
+			"editor/context": [
+				{
+					"command": "saddle.runFunction",
+					"when": "resourceExtname == .mcfunction",
+					"group": "navigation@1"
+				}
+			],
+			"explorer/context": [
+				{
+					"command": "saddle.runFunction",
+					"when": "resourceExtname == .mcfunction",
+					"group": "saddle@1"
+				}
+			],
+			"commandPalette": [
+				{
+					"command": "saddle.runFunction",
+					"when": "resourceExtname == .mcfunction"
+				},
+				{
+					"command": "saddle.watchNode",
+					"when": "false"
+				},
+				{
+					"command": "saddle.renameWatch",
+					"when": "false"
+				}
+			],
+			"webview/context": [
+				{
+					"command": "saddle.renameWatch",
+					"when": "webviewId == 'saddleLiveWatch' && webviewSection == 'saddleWatchPin'"
+				},
+				{
+					"command": "saddle.watchNode",
+					"when": "webviewId == 'saddleLiveWatch' && webviewSection == 'saddleWatchNode'"
+				}
+			],
 			"view/title": [
 				{
 					"command": "saddle.pin",
@@ -164,6 +236,28 @@
 				"command": "saddle.liveRefresh",
 				"title": "Saddle: Refresh Live Watch",
 				"icon": "$(refresh)"
+			},
+			{
+				"command": "saddle.watchNode",
+				"title": "Add to Saddle Watch"
+			},
+			{
+				"command": "saddle.renameWatch",
+				"title": "Rename"
+			},
+			{
+				"command": "saddle.runFunction",
+				"title": "Saddle: Run Function From File",
+				"shortTitle": "Run Function",
+				"icon": "$(play)"
+			},
+			{
+				"command": "saddle.reload",
+				"title": "Saddle: Reload Datapacks"
+			},
+			{
+				"command": "saddle.toggleReloadOnSave",
+				"title": "Saddle: Toggle Reload on Save"
 			}
 		]
 	}

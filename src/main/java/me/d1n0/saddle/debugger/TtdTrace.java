@@ -31,9 +31,14 @@ import java.util.function.Predicate;
  */
 public final class TtdTrace {
 
-    /** One executed command. {@code index} doubles as the global sequence stamp. */
+    /**
+     * One executed command. {@code index} doubles as the global sequence
+     * stamp. Position and dimension are null when the source is not a
+     * command source stack; they are kept raw and only formatted on display,
+     * since a step is recorded for every executed command.
+     */
     public record Step(long index, Identifier functionId, int line, int depth,
-            String executor, String entityUuid, String position, String dimension,
+            String executor, String entityUuid, Vec3 position, Identifier dimension,
             Map<String, String> macroArgs) {}
 
     private record ScoreDelta(long seq, String objective, String holder, Integer before) {}
@@ -46,7 +51,12 @@ public final class TtdTrace {
         private long appended;
 
         Ring(int capacity) {
-            items = new Object[capacity];
+            items = new Object[Math.max(1, capacity)];
+        }
+
+        void clear() {
+            java.util.Arrays.fill(items, null);
+            appended = 0;
         }
 
         void add(T item) {
@@ -91,17 +101,16 @@ public final class TtdTrace {
             Map<String, String> macroArgs) {
         String executor = "server";
         String entityUuid = null;
-        String position = "";
-        String dimension = "";
+        Vec3 position = null;
+        Identifier dimension = null;
         if (source instanceof CommandSourceStack css) {
             Entity entity = css.getEntity();
             if (entity != null) {
                 executor = css.getTextName();
                 entityUuid = entity.getUUID().toString();
             }
-            Vec3 pos = css.getPosition();
-            position = String.format(Locale.ROOT, "%.2f %.2f %.2f", pos.x, pos.y, pos.z);
-            dimension = css.getLevel().dimension().identifier().toString();
+            position = css.getPosition();
+            dimension = css.getLevel().dimension().identifier();
         }
         synchronized (LOCK) {
             STEPS.add(new Step(nextSeq++, functionId, line, depth,
@@ -169,10 +178,21 @@ public final class TtdTrace {
         }
     }
 
-    /** Seeds the score shadow so the first recorded write has a before-value. */
-    public static void primeScoreboard() {
+    /**
+     * Starts a fresh recording for a new debug session. Nothing is recorded
+     * while no client is attached, so history from an earlier session (or an
+     * earlier world in the same JVM) would reconstruct wrong values across
+     * that gap; it is dropped. Also seeds the score shadow so the first
+     * recorded write has a before-value. Server thread.
+     */
+    public static void startRecording() {
         Scoreboard scoreboard = DebugSession.server().getScoreboard();
         synchronized (LOCK) {
+            STEPS.clear();
+            SCORE_DELTAS.clear();
+            STORAGE_DELTAS.clear();
+            pendingStorageId = null;
+            pendingStorageBefore = null;
             SCORE_SHADOW.clear();
             for (Objective objective : scoreboard.getObjectives()) {
                 for (PlayerScoreEntry entry : scoreboard.listPlayerScores(objective)) {
@@ -343,8 +363,11 @@ public final class TtdTrace {
         Map<String, String> values = new LinkedHashMap<>();
         values.put("executor", step.executor());
         if (step.entityUuid() != null) values.put("uuid", step.entityUuid());
-        if (!step.position().isEmpty()) values.put("position", step.position());
-        if (!step.dimension().isEmpty()) values.put("dimension", step.dimension());
+        Vec3 pos = step.position();
+        if (pos != null) {
+            values.put("position", String.format(Locale.ROOT, "%.2f %.2f %.2f", pos.x, pos.y, pos.z));
+        }
+        if (step.dimension() != null) values.put("dimension", step.dimension().toString());
         return values;
     }
 }

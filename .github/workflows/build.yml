@@ -1,5 +1,7 @@
 # Build the mod, validate the VS Code extension, and run the full DAP smoke
-# test against a real dedicated server for every push and pull request.
+# test against a real dedicated server for every push and pull request — once
+# per supported Minecraft version (gradle.properties holds the release target;
+# the matrix overrides it with -P for the other versions).
 
 name: build
 on: [pull_request, push]
@@ -7,6 +9,16 @@ on: [pull_request, push]
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - minecraft: '26.2'
+            fabric_api: '0.154.0+26.2'
+          - minecraft: '26.3'
+            fabric_api: '0.161.0+26.3'
+    env:
+      VERSION_ARGS: -Pminecraft_version=${{ matrix.minecraft }} -Pfabric_api_version=${{ matrix.fabric_api }}
     steps:
       - name: checkout repository
         uses: actions/checkout@v4
@@ -20,7 +32,7 @@ jobs:
       - name: make gradle wrapper executable
         run: chmod +x ./gradlew
       - name: build
-        run: ./gradlew build
+        run: ./gradlew build $VERSION_ARGS
       - name: validate vscode extension
         run: node --check vscode-extension/extension.js
       - name: prepare test server
@@ -31,7 +43,7 @@ jobs:
       - name: run dap smoke test
         timeout-minutes: 20
         run: |
-          ./gradlew runServer > server.log 2>&1 &
+          ./gradlew runServer $VERSION_ARGS > server.log 2>&1 &
           SERVER_PID=$!
           for i in $(seq 1 120); do
             grep -q "Saddle DAP server listening" server.log && break
@@ -49,5 +61,5 @@ jobs:
       - name: capture build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Artifacts
+          name: Artifacts-${{ matrix.minecraft }}
           path: build/libs/

@@ -2,6 +2,7 @@ package me.d1n0.saddle.dap;
 
 import me.d1n0.saddle.debugger.BreakpointManager;
 import me.d1n0.saddle.debugger.CommandRunner;
+import me.d1n0.saddle.debugger.DatapackReloader;
 import me.d1n0.saddle.debugger.DebugSession;
 import me.d1n0.saddle.debugger.FunctionIndex;
 import me.d1n0.saddle.debugger.StackSnapshot;
@@ -44,6 +45,7 @@ final class DapSession implements DebugSession.Listener, Closeable {
     static final int THREAD_ID = 1;
     private static final long EVALUATE_TIMEOUT_MS = 3000;
     private static final long INTROSPECT_TIMEOUT_MS = 5000;
+    private static final long RELOAD_TIMEOUT_MS = 60000;
 
     private final Socket socket;
     private final InputStream in;
@@ -64,11 +66,12 @@ final class DapSession implements DebugSession.Listener, Closeable {
     }
 
     void run() {
-        // Prime the score shadow and attach in one server-thread task:
-        // recording starts (armed) in the same tick the shadow is seeded, so
-        // no score write can slip in between and record a wrong before-value.
+        // Start a fresh recording and attach in one server-thread task:
+        // recording starts (armed) in the same tick the score shadow is
+        // seeded, so no score write can slip in between and record a wrong
+        // before-value.
         DebugSession.callOnServerThread(() -> {
-            TtdTrace.primeScoreboard();
+            TtdTrace.startRecording();
             if (!closed) {
                 DebugSession.attach(this);
                 if (closed) DebugSession.detach(this);
@@ -219,6 +222,9 @@ final class DapSession implements DebugSession.Listener, Closeable {
                     invalidateVariables();
                 }
                 case "saddle/pins" -> respond(requestSeq, command, Map.of("pins", List.copyOf(pins)));
+                // Editor integration: reload on save and "run function from file".
+                case "saddle/reload" -> handleReload(requestSeq, command);
+                case "saddle/runFunction" -> handleCommandEvaluate(requestSeq, command, runFunctionCommand(args));
                 // Stateless live inspection for the extension's watch panel:
                 // works while the game is running, no variablesReferences.
                 case "saddle/live" -> {
@@ -228,14 +234,19 @@ final class DapSession implements DebugSession.Listener, Closeable {
                     respond(requestSeq, command, onServerThread(
                             () -> VariableTree.resolveLive(expression, path, frame)));
                 }
+                // Without "name", sets the value of the expression itself.
                 case "saddle/liveSet" -> {
                     String expression = Args.requireString(args, "expression");
                     List<String> path = argPath(args);
-                    String name = Args.requireString(args, "name");
+                    String name = Args.getString(args, "name");
                     String value = Args.requireString(args, "value");
+                    if (name == null && !path.isEmpty()) {
+                        throw new IllegalArgumentException("A child name is required below the expression root");
+                    }
                     StackSnapshot.Frame frame = innermostFrame();
-                    String newValue = onServerThread(
-                            () -> VariableTree.resolveLiveSet(expression, path, name, value, frame));
+                    String newValue = onServerThread(() -> name == null
+                            ? VariableTree.setExpression(expression, value, frame)
+                            : VariableTree.resolveLiveSet(expression, path, name, value, frame));
                     respond(requestSeq, command, Map.of("value", newValue));
                     invalidateVariables();
                 }
@@ -417,14 +428,13 @@ final class DapSession implements DebugSession.Listener, Closeable {
                 .whenComplete((result, error) -> {
                     try {
                         if (error != null) {
-                            Throwable cause = error.getCause() != null ? error.getCause() : error;
-                            if (cause instanceof TimeoutException || error instanceof TimeoutException) {
+                            Throwable cause = unwrap(error);
+                            if (cause instanceof TimeoutException) {
                                 respond(requestSeq, command, Map.of(
                                         "result", "(no result: the command is still running — it may have hit a breakpoint)",
                                         "variablesReference", 0));
                             } else {
-                                respondError(requestSeq, command,
-                                        cause.getMessage() != null ? cause.getMessage() : cause.toString());
+                                respondError(requestSeq, command, messageOf(cause));
                             }
                             return;
                         }
@@ -440,6 +450,62 @@ final class DapSession implements DebugSession.Listener, Closeable {
                         // Session is closing; nothing to deliver to.
                     }
                 });
+    }
+
+    /**
+     * Datapack reload for the extension's reload-on-save. Responds
+     * asynchronously like console evaluation: #load functions run inside the
+     * reload and may stop at a breakpoint.
+     */
+    private void handleReload(int requestSeq, String command) {
+        DatapackReloader.reload()
+                .orTimeout(RELOAD_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .whenComplete((unused, error) -> {
+                    try {
+                        if (error != null) {
+                            Throwable cause = unwrap(error);
+                            respondError(requestSeq, command, cause instanceof TimeoutException
+                                    ? "The reload is still running — a #load function may have hit a breakpoint"
+                                    : "Reload failed: " + messageOf(cause));
+                            return;
+                        }
+                        onOutput("Saddle: datapacks reloaded");
+                        respond(requestSeq, command, Map.of());
+                    } catch (IOException ignored) {
+                        // Session is closing; nothing to deliver to.
+                    }
+                });
+    }
+
+    /**
+     * The command for "run function from file": {@code function <id> [args]}
+     * for the function at the given client path, optionally wrapped in
+     * {@code execute as <executor> at @s run}. The path resolves like a
+     * breakpoint path, so any datapack workspace layout works.
+     */
+    private static String runFunctionCommand(Map<String, Object> args) {
+        String path = Args.requireString(args, "path");
+        Identifier id = FunctionIndex.resolveClientPath(path);
+        if (id == null) {
+            throw new IllegalArgumentException(
+                    "Not a datapack function file (expected data/<namespace>/function/<path>.mcfunction): " + path);
+        }
+        if (!FunctionIndex.isKnown(id)) {
+            throw new IllegalArgumentException("Function " + id + " is not loaded; reload the datapacks first");
+        }
+        FunctionIndex.learnClientPath(id, path);
+        String macroArgs = singleLine(Args.getString(args, "arguments"), "arguments");
+        String executor = singleLine(Args.getString(args, "executor"), "executor");
+        String function = "function " + id + (macroArgs.isEmpty() ? "" : " " + macroArgs);
+        return executor.isEmpty() ? function : "execute as " + executor + " at @s run " + function;
+    }
+
+    private static String singleLine(String value, String name) {
+        String text = value == null ? "" : value.strip();
+        if (text.indexOf('\n') >= 0 || text.indexOf('\r') >= 0) {
+            throw new IllegalArgumentException("The " + name + " must be a single line");
+        }
+        return text;
     }
 
     /**
@@ -492,12 +558,12 @@ final class DapSession implements DebugSession.Listener, Closeable {
     // Helpers
     // ------------------------------------------------------------------
 
-    private interface GameCall<T> {
+    interface GameCall<T> {
         T get() throws Exception;
     }
 
     /** Runs on the server thread (pause-queue aware) with a bounded wait. */
-    private <T> T onServerThread(GameCall<T> call) throws Exception {
+    static <T> T onServerThread(GameCall<T> call) throws Exception {
         return DebugSession.<T>callOnServerThread(() -> {
             try {
                 return call.get();
@@ -507,6 +573,15 @@ final class DapSession implements DebugSession.Listener, Closeable {
                 throw new RuntimeException(e.getMessage(), e);
             }
         }).get(INTROSPECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** The failure behind an async completion (unwraps CompletionException). */
+    private static Throwable unwrap(Throwable error) {
+        return error.getCause() != null ? error.getCause() : error;
+    }
+
+    private static String messageOf(Throwable error) {
+        return error.getMessage() != null ? error.getMessage() : error.toString();
     }
 
     /** Tells the client to re-fetch the Variables view after a state change. */

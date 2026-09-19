@@ -1,7 +1,6 @@
 package me.d1n0.saddle.dap;
 
 import me.d1n0.saddle.debugger.DataInspector;
-import me.d1n0.saddle.debugger.DebugSession;
 import me.d1n0.saddle.debugger.FunctionIndex;
 import me.d1n0.saddle.debugger.MinecraftIntrospect;
 import me.d1n0.saddle.debugger.TtdTrace;
@@ -13,15 +12,12 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Non-standard requests: "minecraft/*" game-state access and "saddle/trace".
  * Game reads/writes are dispatched to the server thread (pause-queue aware).
  */
 final class CustomRequests {
-    private static final long TIMEOUT_MS = 5000;
-
     private CustomRequests() {}
 
     static boolean handles(String command) {
@@ -99,19 +95,8 @@ final class CustomRequests {
         return Map.of("steps", steps);
     }
 
-    private interface GameQuery {
-        Map<String, Object> get() throws Exception;
-    }
-
-    private static Map<String, Object> onServerThread(GameQuery query) throws Exception {
-        return DebugSession.callOnServerThread(() -> {
-            try {
-                return query.get();
-            } catch (RuntimeException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new RuntimeException(e.getMessage(), e);
-            }
-        }).get(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    private static Map<String, Object> onServerThread(DapSession.GameCall<Map<String, Object>> query)
+            throws Exception {
+        return DapSession.onServerThread(query);
     }
 }
