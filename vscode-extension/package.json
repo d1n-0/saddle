@@ -2,7 +2,7 @@
 	"name": "saddle-debug",
 	"displayName": "Saddle — Minecraft Datapack Debugger",
 	"description": "Debug Minecraft datapack .mcfunction files through the Saddle mod: breakpoints (incl. macro lines), stepping, call stacks, live scoreboard/storage/entity NBT editing, a command console, run-from-file and reload on save.",
-	"version": "1.2.0",
+	"version": "1.2.1",
 	"publisher": "d1n0",
 	"license": "MIT",
 	"repository": {

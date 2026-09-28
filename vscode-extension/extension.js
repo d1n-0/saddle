@@ -408,20 +408,31 @@ class SaddleWatchViewProvider {
 		return 'value';
 	}
 
+	// The view refreshes on a timer, so a rebuild must not disturb what the
+	// user is doing: identical data is not re-rendered at all, and a rebuild
+	// restores the scroll offset and the focused row.
+	let lastRendered;
+
 	window.addEventListener('message', (event) => {
 		const { rows, attached } = event.data;
 		const tree = document.getElementById('tree');
 		const empty = document.getElementById('empty');
 		if (!attached || !rows.length) {
-			tree.innerHTML = '';
+			lastRendered = undefined;
+			tree.replaceChildren();
 			empty.style.display = 'block';
 			return;
 		}
+		const rendered = JSON.stringify(rows);
+		if (rendered === lastRendered) return;
+		lastRendered = rendered;
 		empty.style.display = 'none';
-		// Rows are rebuilt on every refresh; keep keyboard focus on the same row.
 		const focusedKey = document.activeElement && document.activeElement.dataset
 			? document.activeElement.dataset.key : undefined;
-		tree.innerHTML = '';
+		const scroller = document.scrollingElement || document.documentElement;
+		const scrollTop = scroller.scrollTop;
+		const fragment = document.createDocumentFragment();
+		let focusedRow;
 		for (const row of rows) {
 			const el = document.createElement('div');
 			el.className = 'row' + (row.open ? ' open' : '');
@@ -496,9 +507,13 @@ class SaddleWatchViewProvider {
 				el.addEventListener('click', () =>
 					vscodeApi.postMessage({ type: 'toggle', expr: row.expr, path: row.path }));
 			}
-			tree.appendChild(el);
-			if (el.dataset.key === focusedKey) el.focus();
+			if (el.dataset.key === focusedKey) focusedRow = el;
+			fragment.appendChild(el);
 		}
+		tree.replaceChildren(fragment);
+		scroller.scrollTop = scrollTop;
+		// preventScroll: focusing must not scroll the row back into view.
+		if (focusedRow) focusedRow.focus({ preventScroll: true });
 	});
 	// F2 renames the focused pin, like renaming in a native tree.
 	document.addEventListener('keydown', (e) => {
